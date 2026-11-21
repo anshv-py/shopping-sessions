@@ -3,7 +3,7 @@ FROM rust:1.89-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-ENV RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64-v3"
+ENV RUSTFLAGS="-C target-feature=+crt-static -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq"
 RUN cargo build --release --target x86_64-unknown-linux-gnu \
  && cp target/x86_64-unknown-linux-gnu/release/sessions /sessions \
  && strip /sessions

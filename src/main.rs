@@ -485,7 +485,7 @@ fn main() {
         diag::run(&data, &outdir);
     }
     let knob = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
-    let chunk_size = knob("CHUNK_KB").map_or(1 << 20, |k| k << 10);
+    let chunk_size = knob("CHUNK_KB").map_or(256 << 10, |k| k << 10);
     let populate = knob("POPULATE").unwrap_or(0) == 1;
     let willneed = knob("WILLNEED").unwrap_or(0) == 1;
 
@@ -592,6 +592,24 @@ fn main() {
                 let buf: &[u8] = &maps[1][c.file];
                 if mode == "split" {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += f[6].1);
+                } else if mode == "keys" {
+                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
+                        acc += (pack_noreg(buf, f[0].0, f[0].1) ^ pack_reg(buf, f[1].0, f[1].1)) as usize
+                    });
+                } else if mode == "ts" {
+                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
+                        acc += ts_at(buf, f[2].0, f[2].1).unwrap_or(1) as usize
+                            + f1_field(buf, f[3].0, f[3].1).unwrap_or(1) as usize
+                    });
+                } else if mode == "ing" {
+                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += f1_field(buf, f[3].0, f[3].1).unwrap_or(1) as usize);
+                } else if mode == "tsonly" {
+                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += ts_at(buf, f[2].0, f[2].1).unwrap_or(1) as usize);
+                } else if mode == "push" {
+                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
+                        let k = f[0].0 as u64 * 0x9E37_79B9_7F4A_7C15;
+                        sc.push(part1(k), ERec { eid: k, uid: f[1].0 as u64, ingest: 0, ts: 0, meta: 0 }, &mut pool)
+                    });
                 } else {
                     events_chunk(buf, c.start, c.end, &ctx, &mut bm, &mut sc, &mut pool);
                 }
@@ -699,7 +717,7 @@ fn main() {
                     let mut o = S2Out { uv: Scatter::new(NP3) };
                     let mut pool = Pool::new();
                     let mut local: Vec<ERec> = Vec::new();
-                    let mut table: Vec<u32> = Vec::new();
+                    let mut table: Vec<u64> = Vec::new();
                     loop {
                         let p = next.fetch_add(1, Ordering::Relaxed);
                         if p >= NP1 {
@@ -984,40 +1002,46 @@ fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
 }
 
 #[inline(never)]
-fn dedup_partition(local: &[ERec], table: &mut Vec<u32>, out: &mut Scatter<URec>, pool: &mut Pool) {
+fn dedup_partition(local: &[ERec], table: &mut Vec<u64>, out: &mut Scatter<URec>, pool: &mut Pool) {
     let n = local.len();
     if n == 0 {
         return;
     }
+    // slot = tag (high 32 bits of a hash of eid) << 32 | index + 1; 0 = empty
     let cap = (2 * n).next_power_of_two().max(16);
     let bits = cap.trailing_zeros();
     let mask = cap - 1;
     table.clear();
-    table.resize(cap, u32::MAX);
+    table.resize(cap, 0);
     for (i, r) in local.iter().enumerate() {
         let eid = r.eid;
+        let hv = eid.wrapping_mul(0xA076_1D64_78BD_642F);
+        let tag = (hv.rotate_left(29) >> 32) << 32;
         let mut h = thash(eid, bits);
         loop {
-            let s = unsafe { *table.get_unchecked(h) };
-            if s == u32::MAX {
-                unsafe { *table.get_unchecked_mut(h) = i as u32 };
+            let slot = unsafe { *table.get_unchecked(h) };
+            if slot == 0 {
+                unsafe { *table.get_unchecked_mut(h) = tag | (i as u64 + 1) };
                 break;
             }
-            let o = unsafe { local.get_unchecked(s as usize) };
-            if o.eid == eid {
-                if r.ingest < o.ingest {
-                    unsafe { *table.get_unchecked_mut(h) = i as u32 };
+            if slot & !0xFFFF_FFFF == tag {
+                let j = (slot as u32 - 1) as usize;
+                let o = unsafe { local.get_unchecked(j) };
+                if o.eid == eid {
+                    if r.ingest < o.ingest {
+                        unsafe { *table.get_unchecked_mut(h) = tag | (i as u64 + 1) };
+                    }
+                    break;
                 }
-                break;
             }
             h = (h + 1) & mask;
         }
     }
-    for &s in table.iter() {
-        if s == u32::MAX {
+    for &slot in table.iter() {
+        if slot == 0 {
             continue;
         }
-        let r = unsafe { *local.get_unchecked(s as usize) };
+        let r = unsafe { *local.get_unchecked((slot as u32 - 1) as usize) };
         if r.ts == u32::MAX {
             continue;
         }

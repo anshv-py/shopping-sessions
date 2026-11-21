@@ -143,6 +143,46 @@ fn window(v: &[u64], a: usize) -> u128 {
     }
 }
 
+/// Inclusive prefix XOR of the bits of x (bit i = xor of bits 0..=i).
+#[inline(always)]
+fn prefix_xor64(x: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let r = _mm_clmulepi64_si128(_mm_set_epi64x(0, x as i64), _mm_set1_epi8(-1), 0);
+        _mm_cvtsi128_si64(r) as u64
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+    {
+        let mut x = x;
+        x ^= x << 1;
+        x ^= x << 2;
+        x ^= x << 4;
+        x ^= x << 8;
+        x ^= x << 16;
+        x ^= x << 32;
+        x
+    }
+}
+
+/// Quote rules for one line of length l (< 128) given its quote and comma bits: quotes
+/// come in pairs, each opening one at a field start and its partner at the same field's
+/// end, with no comma in between (simdjson-style pairing via prefix XOR).
+#[inline(always)]
+fn quotes_ok(qw: u128, commas: u128, l: usize) -> bool {
+    if qw.count_ones() & 1 == 1 {
+        return false;
+    }
+    let lo = prefix_xor64(qw as u64);
+    let hi = prefix_xor64((qw >> 64) as u64) ^ (((lo >> 63) & 1).wrapping_neg());
+    let inside = (lo as u128) | ((hi as u128) << 64);
+    let opening = qw & inside;
+    let closing = qw & !inside;
+    let starts = (commas << 1) | 1;
+    let ends = (commas >> 1) | (1u128 << (l - 1));
+    (opening & !starts) == 0 && (closing & !ends) == 0 && (inside & commas) == 0
+}
+
 /// Calls `cb` with the N fields (quotes stripped) of every well-formed line that starts
 /// in [start, end). Malformed lines (wrong field count, stray quotes, empty) are skipped.
 #[inline(always)]
@@ -202,10 +242,11 @@ pub fn for_lines<const N: usize>(
         let le = w * 64 + nbits.trailing_zeros() as usize;
         nbits &= nbits - 1;
         let l = le - ls;
-        if l < 128 {
+        let ok = if l < 128 {
             let lm: u128 = (1u128 << l) - 1;
-            let mut cw = window(com, ls) & lm;
-            if cw.count_ones() as usize == N - 1 {
+            let commas = window(com, ls) & lm;
+            if commas.count_ones() as usize == N - 1 {
+                let mut cw = commas;
                 let mut prev = ls;
                 for fk in f.iter_mut().take(N - 1) {
                     let p = ls + cw.trailing_zeros() as usize;
@@ -214,30 +255,28 @@ pub fn for_lines<const N: usize>(
                     prev = p + 1;
                 }
                 f[N - 1] = (b0 + prev, b0 + le);
-                let q = (window(quo, ls) & lm).count_ones();
-                if q == 0 {
-                    cb(&f);
-                } else {
-                    let mut shaped = 0u32;
+                let qw = window(quo, ls) & lm;
+                if qw == 0 {
+                    true
+                } else if quotes_ok(qw, commas, l) {
+                    // every quote pairs up around a whole field: strip them
                     for fk in f.iter_mut() {
-                        let (a, b) = *fk;
-                        let sh = (b - a >= 2)
-                            && unsafe { *buf.get_unchecked(a) } == b'"'
-                            && unsafe { *buf.get_unchecked(b - 1) } == b'"';
-                        let d = sh as usize;
-                        *fk = (a + d, b - d);
-                        shaped += d as u32;
+                        let d = ((qw >> (fk.0 - b0 - ls)) & 1) as usize;
+                        *fk = (fk.0 + d, fk.1 - d);
                     }
-                    if q == 2 * shaped {
-                        cb(&f);
-                    }
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
             }
         } else {
-            let (_, ok) = parse_line::<N>(&buf[..b0 + le], b0 + ls, &mut f);
-            if ok {
-                cb(&f);
-            }
+            parse_line::<N>(&buf[..b0 + le], b0 + ls, &mut f).1
+        };
+        // single call site, so the callback inlines into the loop
+        if ok {
+            cb(&f);
         }
         ls = le + 1;
     }
@@ -547,15 +586,81 @@ fn digits_ok(v: u64, m: u64) -> bool {
     (v & hi) == (0x3030_3030_3030_3030 & m) && (((v & lo).wrapping_add(0x0606_0606_0606_0606 & m)) & hi) == 0
 }
 
-const MA: u64 = lane_mask(&[0, 1, 2, 3, 5, 6]);
-const MB: u64 = lane_mask(&[0, 1, 3, 4, 6, 7]);
 const MC: u64 = lane_mask(&[1, 2]);
-const SAM: u64 = lane_mask(&[4, 7]);
-const SBM: u64 = lane_mask(&[2, 5]);
 const SCM: u64 = lane_mask(&[0, 3]);
-const SA: u64 = (0x2Du64 << 32) | (0x2Du64 << 56);
-const SB: u64 = (0x54u64 << 16) | (0x3Au64 << 40);
 const SC: u64 = 0x3A | (0x5Au64 << 24);
+
+// Per-thread cache of the date part (`YYYY-MM-DD`) -> days since epoch. Timestamps in a
+// dataset fall within a few weeks, so nearly every lookup hits.
+struct DayCache {
+    a: [u64; 64],
+    dd: [u32; 64],
+    days: [i32; 64],
+}
+
+thread_local! {
+    static DC: std::cell::UnsafeCell<DayCache> =
+        const { std::cell::UnsafeCell::new(DayCache { a: [0; 64], dd: [0; 64], days: [i32::MIN; 64] }) };
+}
+
+const DMA: u64 = lane_mask(&[0, 1, 2, 3, 5, 6]);
+const DSM: u64 = lane_mask(&[4, 7]);
+const DS: u64 = (0x2Du64 << 32) | (0x2Du64 << 56);
+
+#[cold]
+fn date_slow(a: u64, dd: u64) -> Option<i64> {
+    if (a & DSM) != DS || !digits_ok(a, DMA) || !digits_ok(dd, 0xFFFF) {
+        return None;
+    }
+    let da = a & 0x0F0F_0F0F_0F0F_0F0F;
+    let ta = da.wrapping_mul(10).wrapping_add(da >> 8);
+    let y = ((ta & 0xFF) * 100 + ((ta >> 16) & 0xFF)) as i64;
+    let mo = ((ta >> 40) & 0xFF) as i64;
+    let d = ((dd & 0x0F) * 10 + ((dd >> 8) & 0x0F)) as i64;
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d))
+}
+
+/// Days since epoch of the date in `a` (bytes 0..8) and the low two bytes of `b`.
+#[inline(always)]
+fn date_days(a: u64, b: u64) -> Option<i64> {
+    let dd = b & 0xFFFF;
+    let idx = ((dd ^ (dd >> 6) ^ (a >> 40)) & 63) as usize;
+    DC.with(|c| {
+        let c = unsafe { &mut *c.get() };
+        if c.a[idx] == a && c.dd[idx] == dd as u32 {
+            let v = c.days[idx];
+            return if v == i32::MIN { None } else { Some(v as i64) };
+        }
+        let v = date_slow(a, dd);
+        c.a[idx] = a;
+        c.dd[idx] = dd as u32;
+        c.days[idx] = v.map_or(i32::MIN, |x| x as i32);
+        v
+    })
+}
+
+const TBM: u64 = lane_mask(&[3, 4, 6, 7]);
+const TSM: u64 = lane_mask(&[2, 5]);
+const TS: u64 = (0x54u64 << 16) | (0x3Au64 << 40);
+
+/// `THH:MM` in b's lanes 2..8 -> (hour, minute), validated.
+#[inline(always)]
+fn hm(b: u64) -> Option<(i64, i64)> {
+    if (b & TSM) != TS || !digits_ok(b, TBM) {
+        return None;
+    }
+    let db = b & 0x0F0F_0F0F_0F0F_0F0F;
+    let tb = db.wrapping_mul(10).wrapping_add(db >> 8);
+    let h = ((tb >> 24) & 0xFF) as i64;
+    let mi = ((tb >> 48) & 0xFF) as i64;
+    if (h > 23) | (mi > 59) {
+        return None;
+    }
+    Some((h, mi))
+}
 
 /// F1 `YYYY-MM-DDTHH:MM:SSZ` at buf[s..s+20].
 #[inline(always)]
@@ -563,37 +668,44 @@ fn f1_at(buf: &[u8], s: usize) -> Option<i64> {
     let a = rd64(buf, s);
     let b = rd64(buf, s + 8);
     let c = rd32(buf, s + 16) as u64;
-    let ok = ((a & SAM) == SA) & ((b & SBM) == SB) & ((c & SCM) == SC) & digits_ok(a, MA) & digits_ok(b, MB) & digits_ok(c, MC);
-    if !ok {
+    if (c & SCM) != SC || !digits_ok(c, MC) {
         return None;
     }
-    let da = a & 0x0F0F_0F0F_0F0F_0F0F;
-    let ta = da.wrapping_mul(10).wrapping_add(da >> 8);
-    let db = b & 0x0F0F_0F0F_0F0F_0F0F;
-    let tb = db.wrapping_mul(10).wrapping_add(db >> 8);
-    let y = ((ta & 0xFF) * 100 + ((ta >> 16) & 0xFF)) as i64;
-    let mo = ((ta >> 40) & 0xFF) as i64;
-    let d = (tb & 0xFF) as i64;
-    let h = ((tb >> 24) & 0xFF) as i64;
-    let mi = ((tb >> 48) & 0xFF) as i64;
     let se = (((c >> 8) & 0x0F) * 10 + ((c >> 16) & 0x0F)) as i64;
-    if (h > 23) | (mi > 59) | (se > 59) | (mo > 12) | (d > 31) {
+    let (h, mi) = hm(b)?;
+    if se > 59 {
         return None;
     }
-    let yi = (y - CAL_Y0) as usize;
-    let days = if yi < CAL_NY {
-        let v = unsafe { *calendar().get_unchecked(yi * 416 + mo as usize * 32 + d as usize) };
-        if v == i32::MIN {
-            return None;
-        }
-        v as i64
-    } else {
-        if mo < 1 || d < 1 || d > days_in_month(y, mo) {
-            return None;
-        }
-        days_from_civil(y, mo, d)
-    };
+    let days = date_days(a, b)?;
     Some((days * 86_400 + h * 3600 + mi * 60 + se) * 1000)
+}
+
+/// F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` at buf[s..s+25].
+#[inline(always)]
+fn f2_at(buf: &[u8], s: usize) -> Option<i64> {
+    let a = rd64(buf, s);
+    let b = rd64(buf, s + 8);
+    let x = rd64(buf, s + 17); // S S sign H H : M M
+    if buf[s + 16] != b':' || ((x >> 40) & 0xFF) != 0x3A || !digits_ok(x, lane_mask(&[0, 1, 3, 4, 6, 7])) {
+        return None;
+    }
+    let sign = (x >> 16) & 0xFF;
+    if sign != 0x2B && sign != 0x2D {
+        return None;
+    }
+    let dx = x & 0x0F0F_0F0F_0F0F_0F0F;
+    let tx = dx.wrapping_mul(10).wrapping_add(dx >> 8);
+    let se = (tx & 0xFF) as i64;
+    let oh = ((tx >> 24) & 0xFF) as i64;
+    let om = ((tx >> 48) & 0xFF) as i64;
+    let (h, mi) = hm(b)?;
+    if (se > 59) | (oh > 23) | (om > 59) {
+        return None;
+    }
+    let days = date_days(a, b)?;
+    let t = (days * 86_400 + h * 3600 + mi * 60 + se) * 1000;
+    let off = (oh * 60 + om) * 60_000;
+    Some(if sign == 0x2B { t - off } else { t + off })
 }
 
 /// F3 digits at buf[s..e] (1..=16 of them, with 16 readable bytes from s).
@@ -631,6 +743,9 @@ pub fn ts_at(buf: &[u8], s: usize, e: usize) -> Option<i64> {
     }
     if len >= 1 && len <= 16 && s + 16 <= buf.len() && buf[s].wrapping_sub(b'0') < 10 {
         return f3_at(buf, s, e);
+    }
+    if len == 25 {
+        return f2_at(buf, s);
     }
     parse_ts(&buf[s..e])
 }
