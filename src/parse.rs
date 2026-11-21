@@ -91,13 +91,18 @@ pub fn parse_line<const N: usize>(buf: &[u8], mut i: usize, f: &mut [(usize, usi
 
 // ---------------------------------------------------------------- SIMD line walker
 
-/// Per-thread scratch for `for_lines`: quote bitmask, delimiter positions and the
-/// newline flag of each delimiter (one bit per delimiter) of one chunk.
+/// Per-thread scratch for `for_lines`: per 64-byte word the quote, delimiter and newline
+/// bits; the flattened delimiter positions; and three bit streams with one bit per
+/// delimiter (is a newline / next byte is a quote / previous byte closes a quoted field).
 #[derive(Default)]
 pub struct Masks {
     quo: Vec<u64>,
+    del: Vec<u64>,
+    nl: Vec<u64>,
     pos: Vec<u32>,
     nlf: Vec<u64>,
+    qsf: Vec<u64>,
+    qef: Vec<u64>,
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -181,6 +186,19 @@ fn bits64(v: &[u64], i: usize) -> u64 {
     lo | hi
 }
 
+/// Appends `x` (its bits past the count being appended are zero) at bit `at` of a stream
+/// filled up to `at`: ORs into the current word and assigns the next, so streams need no
+/// clearing (bits past the last delimiter are stale and never inspected).
+#[inline(always)]
+fn put_bits(v: &mut [u64], at: usize, x: u64) {
+    let w = at >> 6;
+    let sh = (at & 63) as u32;
+    unsafe {
+        *v.get_unchecked_mut(w) |= x << sh;
+        *v.get_unchecked_mut(w + 1) = (x >> 1) >> (63 - sh);
+    }
+}
+
 /// Index of the first set bit at or after bit `i` (one must exist).
 #[cold]
 #[inline(never)]
@@ -198,11 +216,12 @@ fn next_set(v: &[u64], i: usize) -> usize {
 /// in [start, end). Malformed lines (wrong field count, stray quotes, empty) are skipped.
 ///
 /// Commas are always delimiters (a comma inside quotes makes the line malformed), so a
-/// well-formed line is exactly N-1 commas then a newline. Delimiter positions are first
-/// flattened into an array (with a parallel bit stream marking the newlines), so each
-/// line's fields are N consecutive entries. Quote rule: every field is either free of
-/// quotes or is `"` + quote-free text + `"`, i.e. the line's quote count equals twice the
-/// number of fields of length >= 2 that start and end with a quote.
+/// well-formed line is exactly N-1 commas then a newline. Delimiter positions are
+/// flattened into an array, with bit streams marking per delimiter: newline; the next byte
+/// is a quote (the following field opens with one); the previous byte is a quote that is
+/// not a whole one-byte field (the preceding field closes with one). Quote rule: every
+/// field is free of quotes or is `"` + quote-free text + `"`, i.e. the line's quote count
+/// equals twice the number of fields that both open and close with a quote.
 #[inline(always)]
 pub fn for_lines<const N: usize>(
     buf: &[u8],
@@ -220,25 +239,71 @@ pub fn for_lines<const N: usize>(
     let n = e1 - b0;
     assert!(n < u32::MAX as usize - 64, "chunk too large");
     let words = n / 64 + 4;
-    m.quo.clear();
-    m.quo.resize(words, 0);
-    // room for every byte being a delimiter, plus the unconditional 16-entry writes
+    for v in [&mut m.quo, &mut m.del, &mut m.nl] {
+        if v.len() < words {
+            v.resize(words, 0);
+        }
+        // words past the data are read (lookahead, virtual newline): keep them zero
+        v[n / 64..words].iter_mut().for_each(|x| *x = 0);
+    }
+    let sw = (n + 80) / 64 + 3; // stream words: at most n + 2 delimiters
+    for v in [&mut m.nlf, &mut m.qsf, &mut m.qef] {
+        if v.len() < sw {
+            v.resize(sw, 0);
+        }
+    }
     m.pos.clear();
-    m.pos.reserve(n + 80);
-    m.nlf.clear();
-    m.nlf.resize((n + 80) / 64 + 3, 0);
+    m.pos.reserve(n + 80); // every byte a delimiter, plus the unconditional 16-entry writes
     let region = &buf[b0..e1];
     let full = n / 64;
-    let pos = m.pos.as_mut_ptr();
-    let nlf = &mut m.nlf;
-    let mut np = 0usize;
-    let mut block = |w: usize, blk: &[u8; 64], np: &mut usize| {
+    for w in 0..full {
+        // w * 64 + 64 <= n and w < words: in bounds
+        let blk: &[u8; 64] = unsafe { &*(region.as_ptr().add(w * 64) as *const [u8; 64]) };
         let (c, l, q) = block3(blk);
-        unsafe { *m.quo.get_unchecked_mut(w) = q };
-        let d = c | l;
+        unsafe {
+            *m.quo.get_unchecked_mut(w) = q;
+            *m.del.get_unchecked_mut(w) = c | l;
+            *m.nl.get_unchecked_mut(w) = l;
+        }
+    }
+    if n % 64 != 0 {
+        let mut tmp = [0u8; 64];
+        tmp[..n % 64].copy_from_slice(&region[full * 64..]);
+        let (c, l, q) = block3(&tmp);
+        m.quo[full] = q;
+        m.del[full] = c | l;
+        m.nl[full] = l;
+    }
+    if region[n - 1] != b'\n' {
+        // the last line ends at the chunk end: a virtual newline there
+        m.nl[n >> 6] |= 1u64 << (n & 63);
+        m.del[n >> 6] |= 1u64 << (n & 63);
+    }
+    // entry 0: a virtual newline at position -1, so line starts are uniform
+    let pos = m.pos.as_mut_ptr();
+    unsafe { *pos = u32::MAX };
+    m.nlf[0] = 1;
+    m.qsf[0] = m.quo[0] & 1;
+    m.qef[0] = 0;
+    let mut np = 1usize;
+    let (quo, del, nl) = (&m.quo, &m.del, &m.nl);
+    let (nlf, qsf, qef) = (&mut m.nlf, &mut m.qsf, &mut m.qef);
+    let mut dprev = 1u64 << 63; // the virtual delimiter at -1
+    let mut qprev = 0u64;
+    for w in 0..=(n >> 6) {
+        let d = del[w];
+        let q = quo[w];
+        let qb = (q << 1) | (qprev >> 63); // quote just before
+        let d2 = (d << 2) | (dprev >> 62); // delimiter two before
+        let qa = (q >> 1) | (quo[w + 1] << 63); // quote just after
+        dprev = d;
+        qprev = q;
+        if d == 0 {
+            continue;
+        }
         let cnt = d.count_ones() as usize;
         let base = (w * 64) as u32;
-        let p = unsafe { pos.add(*np) };
+        let p = unsafe { pos.add(np) };
         let mut bits = d;
         for k in 0..8 {
             unsafe { *p.add(k) = base + bits.trailing_zeros() };
@@ -256,57 +321,31 @@ pub fn for_lines<const N: usize>(
                 k += 1;
             }
         }
-        let fl = pext64(l, d);
-        let wi = *np >> 6;
-        let sh = (*np & 63) as u32;
-        unsafe {
-            *nlf.get_unchecked_mut(wi) |= fl << sh;
-            *nlf.get_unchecked_mut(wi + 1) |= (fl >> 1) >> (63 - sh);
-        }
-        *np += cnt;
-    };
-    for w in 0..full {
-        let blk: &[u8; 64] = region[w * 64..w * 64 + 64].try_into().unwrap();
-        block(w, blk, &mut np);
-    }
-    if n % 64 != 0 {
-        let mut tmp = [0u8; 64];
-        tmp[..n % 64].copy_from_slice(&region[full * 64..]);
-        block(full, &tmp, &mut np);
-    }
-    if region[n - 1] != b'\n' {
-        // the last line ends at the chunk end: a virtual newline there
-        unsafe { *pos.add(np) = n as u32 };
-        nlf[np >> 6] |= 1u64 << (np & 63);
-        np += 1;
+        put_bits(nlf, np, pext64(nl[w], d));
+        put_bits(qsf, np, pext64(qa, d));
+        put_bits(qef, np, pext64(qb & !d2, d));
+        np += cnt;
     }
     unsafe { m.pos.set_len(np) };
     let pos = &m.pos;
-    let nlf = &m.nlf;
+    let (nlf, qsf, qef) = (&m.nlf, &m.qsf, &m.qef);
     let quo = &m.quo;
     let want = 1u64 << (N - 1);
     let fmask = (1u64 << N) - 1;
     let mut f = [(0usize, 0usize); N];
-    let mut i = 0usize;
+    let mut i = 1usize;
     let mut ls = 0usize;
     while i < np {
         let fl = bits64(nlf, i);
         if fl & fmask == want {
-            // N-1 commas, then the newline
+            // N-1 commas, then the newline; field k spans delimiters i-1+k .. i+k
             let le = unsafe { *pos.get_unchecked(i + N - 1) } as usize;
-            let mut prev = ls;
-            let mut pairs = 0u32;
+            let pm = bits64(qsf, i - 1) & bits64(qef, i) & fmask; // quoted fields
             for (k, fk) in f.iter_mut().enumerate() {
-                let p = unsafe { *pos.get_unchecked(i + k) } as usize;
-                let (s, e) = (b0 + prev, b0 + p);
-                // quoted field: length >= 2, first and last bytes are quotes
-                let long = e >= s + 2;
-                let first = unsafe { *buf.get_unchecked(if long { s } else { b0 }) };
-                let last = unsafe { *buf.get_unchecked(if long { e - 1 } else { b0 }) };
-                let d = (long & (first == b'"') & (last == b'"')) as usize;
-                pairs += d as u32;
-                *fk = (s + d, e - d);
-                prev = p + 1;
+                let s = unsafe { *pos.get_unchecked(i - 1 + k) }.wrapping_add(1) as usize;
+                let e = unsafe { *pos.get_unchecked(i + k) } as usize;
+                let d = ((pm >> k) & 1) as usize;
+                *fk = (b0 + s + d, b0 + e - d);
             }
             let l = le - ls;
             let quotes = if l < 128 {
@@ -315,7 +354,7 @@ pub fn for_lines<const N: usize>(
                 range_pop(quo, ls, le)
             };
             // single call site, so the callback inlines into the loop
-            if quotes == 2 * pairs {
+            if quotes == 2 * pm.count_ones() {
                 cb(&f);
             }
             i += N;
@@ -386,16 +425,17 @@ fn pack_exact(buf: &[u8], s: usize, e: usize) -> Option<u64> {
     if len > 9 {
         return None;
     }
-    if s + 9 <= buf.len() {
+    if len != 0 && s + 9 <= buf.len() {
+        // branch-free: keep the first min(len, 8) bytes, byte 8 only when len == 9
         let raw = rd64(buf, s);
-        let lo = if len >= 8 { raw } else { raw & ((1u64 << (8 * len)) - 1) };
-        let b8 = if len == 9 { buf[s + 8] as u64 } else { 0 };
+        let keep = u64::MAX >> (64 - (8 * len).min(64));
+        let lo = raw & keep;
+        let nine = ((len == 9) as u64).wrapping_neg();
+        let b8 = unsafe { *buf.get_unchecked(s + 8) } as u64 & nine;
         // lanes past the end get 0x01 so the zero-byte test only sees real bytes
-        let pad = if len >= 8 { 0 } else { !((1u64 << (8 * len)) - 1) & ONES };
-        let v = lo | pad;
-        let has_zero = (v.wrapping_sub(ONES) & !v & HIGHS) != 0;
-        let bad = has_zero || (lo & HIGHS) != 0 || b8 >= 0x80 || (len == 9 && b8 == 0);
-        if bad {
+        let v = lo | (!keep & ONES);
+        let bad = (v.wrapping_sub(ONES) & !v & HIGHS) | (lo & HIGHS) | (b8 & 0x80) | (nine & (b8 == 0) as u64);
+        if bad != 0 {
             return None;
         }
         Some((pext7(lo.swap_bytes()) << 7) | b8)
@@ -789,10 +829,10 @@ fn f3_at(buf: &[u8], s: usize, e: usize) -> Option<i64> {
 #[inline(always)]
 pub fn ts_at(buf: &[u8], s: usize, e: usize, dc: &mut DayCache) -> Option<i64> {
     let len = e - s;
-    if len == 20 && buf[s + 19] == b'Z' {
+    if len == 20 && unsafe { *buf.get_unchecked(s + 19) } == b'Z' {
         return f1_at(buf, s, dc);
     }
-    if len >= 1 && len <= 16 && s + 16 <= buf.len() && buf[s].wrapping_sub(b'0') < 10 {
+    if len >= 1 && len <= 16 && s + 16 <= buf.len() && unsafe { *buf.get_unchecked(s) }.wrapping_sub(b'0') < 10 {
         return f3_at(buf, s, e);
     }
     if len == 25 {
@@ -804,7 +844,7 @@ pub fn ts_at(buf: &[u8], s: usize, e: usize, dc: &mut DayCache) -> Option<i64> {
 /// ingest_ts (always F1).
 #[inline(always)]
 pub fn f1_field(buf: &[u8], s: usize, e: usize, dc: &mut DayCache) -> Option<i64> {
-    if e - s == 20 && buf[s + 19] == b'Z' {
+    if e - s == 20 && unsafe { *buf.get_unchecked(s + 19) } == b'Z' {
         f1_at(buf, s, dc)
     } else {
         None
