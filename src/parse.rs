@@ -228,10 +228,13 @@ pub fn for_lines<const N: usize>(
                         let mut shaped = 0u32;
                         for fk in f.iter_mut() {
                             let (a, b) = *fk;
-                            if b - a >= 2 && buf[a] == b'"' && buf[b - 1] == b'"' {
-                                *fk = (a + 1, b - 1);
-                                shaped += 1;
-                            }
+                            // a < b <= len whenever b - a >= 2, so both reads are in bounds
+                            let sh = (b - a >= 2)
+                                && unsafe { *buf.get_unchecked(a) } == b'"'
+                                && unsafe { *buf.get_unchecked(b - 1) } == b'"';
+                            let d = sh as usize;
+                            *fk = (a + d, b - d);
+                            shaped += d as u32;
                         }
                         if q == 2 * shaped {
                             cb(&f);

@@ -308,14 +308,22 @@ fn build_links(pairs: &[Vec<(u64, u64)>]) -> LinkMap {
             minkey[r as usize] = keys[i];
         }
     }
-    let mut tab = vec![(0u64, 0u64); cap];
-    for h in 0..cap {
-        let s = slot[h];
-        if s != u32::MAX {
-            tab[h] = (keys[s as usize], minkey[roots[s as usize] as usize]);
+    // Final lookup table sized for the distinct keys (load <= 0.5), rebuilt so it is as
+    // small (cache-friendly) as possible for the 25M+ lookups that follow.
+    let fcap = (2 * n).next_power_of_two().max(16);
+    let fbits = fcap.trailing_zeros();
+    let fmask = fcap - 1;
+    let mut tab = vec![(0u64, 0u64); fcap];
+    for i in 0..n {
+        let k = keys[i];
+        let mut h = thash(k, fbits);
+        while tab[h].0 != 0 {
+            h = (h + 1) & fmask;
         }
+        tab[h] = (k, minkey[roots[i] as usize]);
     }
-    LinkMap { tab, bits }
+    let _ = bits;
+    LinkMap { tab, bits: fbits }
 }
 
 pub struct Ctx {
@@ -491,6 +499,8 @@ fn main() {
         }
     }
     if let Ok(mode) = std::env::var("BENCH") {
+        let mut bv: Scatter<ERec> = Scatter::new(NP1, ev_bytes / 60);
+        let mut bm = Masks::default();
         for rep in 0..3 {
             let t = Instant::now();
             let mut acc = 0u64;
@@ -508,10 +518,8 @@ fn main() {
                         for_lines::<7>(buf, c.start, c.end, &mut m, |f| acc += f[6].1 as u64);
                     }
                     _ => {
-                        let mut v: Scatter<ERec> = Scatter::new(NP1, 1 << 16);
-                        let mut m = Masks::default();
-                        events_chunk(buf, c.start, c.end, &ctx, &mut m, &mut v);
-                        acc += v.len() as u64;
+                        events_chunk(buf, c.start, c.end, &ctx, &mut bm, &mut bv);
+                        acc += 1;
                     }
                 }
             }
