@@ -298,96 +298,115 @@ fn build_links(pairs: &[Vec<(u64, u64)>]) -> LinkParts {
     if m == 0 {
         return LinkParts { off: vec![0; NP3 + 1], ent: Vec::new() };
     }
-    // At most 2m distinct keys; load factor <= 0.5. Slots hold (key, dense index) during
-    // the build and (key, person) afterwards, so the build table is the lookup table.
     let tb = Instant::now();
-    let cap = (4 * m).next_power_of_two().max(16);
-    let bits = cap.trailing_zeros();
-    let mask = cap - 1;
-    let mut tab: Vec<(u64, u64)> = vec![(0, 0); cap];
-    let mut keys: Vec<u64> = Vec::with_capacity(2 * m);
-    let mut parent: Vec<u32> = Vec::with_capacity(2 * m);
-    #[inline(always)]
-    fn ins(tab: &mut [(u64, u64)], mask: usize, h0: usize, k: u64, keys: &mut Vec<u64>, parent: &mut Vec<u32>) -> u32 {
-        let mut h = h0;
-        loop {
-            let e = unsafe { *tab.get_unchecked(h) };
-            if e.0 == k {
-                return e.1 as u32;
-            }
-            if e.0 == 0 {
-                let idx = keys.len() as u32;
-                unsafe { *tab.get_unchecked_mut(h) = (k, idx as u64) };
-                keys.push(k);
-                parent.push(idx);
-                return idx;
-            }
-            h = (h + 1) & mask;
+    let n2 = 2 * m;
+    // Bucket every side (key, position = 2 * pair + side) by part3(key).
+    let mut cnt = vec![0u32; NP3 + 1];
+    for v in pairs {
+        for &(x, y) in v {
+            cnt[part3(x) + 1] += 1;
+            cnt[part3(y) + 1] += 1;
         }
     }
+    for i in 0..NP3 {
+        cnt[i + 1] += cnt[i];
+    }
+    let mut fill = cnt.clone();
+    let mut bk: Vec<(u64, u32)> = Vec::with_capacity(n2);
+    unsafe { bk.set_len(n2) };
+    let mut p = 0u32;
+    for v in pairs {
+        for &(x, y) in v {
+            let bx = part3(x);
+            unsafe { *bk.get_unchecked_mut(fill[bx] as usize) = (x, p) };
+            fill[bx] += 1;
+            let by = part3(y);
+            unsafe { *bk.get_unchecked_mut(fill[by] as usize) = (y, p + 1) };
+            fill[by] += 1;
+            p += 2;
+        }
+    }
+    // Dedup per bucket with a small table; ids are contiguous per bucket.
+    let mut side = vec![0u32; n2];
+    let mut keys: Vec<u64> = Vec::with_capacity(n2 / 2 + 16);
+    let mut off = vec![0u32; NP3 + 1];
+    let mut table: Vec<u32> = Vec::new();
+    for b in 0..NP3 {
+        off[b] = keys.len() as u32;
+        let sl = &bk[cnt[b] as usize..cnt[b + 1] as usize];
+        if sl.is_empty() {
+            continue;
+        }
+        let cap = (2 * sl.len()).next_power_of_two().max(16);
+        let bits = cap.trailing_zeros();
+        let mask = cap - 1;
+        table.clear();
+        table.resize(cap, u32::MAX);
+        for &(k, pos) in sl {
+            let mut h = thash(k, bits);
+            let id = loop {
+                let t = unsafe { *table.get_unchecked(h) };
+                if t == u32::MAX {
+                    let id = keys.len() as u32;
+                    unsafe { *table.get_unchecked_mut(h) = id };
+                    keys.push(k);
+                    break id;
+                }
+                if unsafe { *keys.get_unchecked(t as usize) } == k {
+                    break t;
+                }
+                h = (h + 1) & mask;
+            };
+            unsafe { *side.get_unchecked_mut(pos as usize) = id };
+        }
+    }
+    off[NP3] = keys.len() as u32;
+    drop(bk);
+    let n = keys.len();
+    let t_dedup = tb.elapsed().as_secs_f64();
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    #[inline(always)]
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let g = parent[parent[x as usize] as usize];
-            parent[x as usize] = g;
-            x = g;
+        unsafe {
+            while *parent.get_unchecked(x as usize) != x {
+                let g = *parent.get_unchecked(*parent.get_unchecked(x as usize) as usize);
+                *parent.get_unchecked_mut(x as usize) = g;
+                x = g;
+            }
         }
         x
     }
-    const D: usize = 8;
-    for v in pairs {
-        let n = v.len();
-        for i in 0..n.min(D) {
-            prefetch(unsafe { tab.as_ptr().add(thash(v[i].0, bits)) });
-            prefetch(unsafe { tab.as_ptr().add(thash(v[i].1, bits)) });
-        }
-        for i in 0..n {
-            if i + D < n {
-                prefetch(unsafe { tab.as_ptr().add(thash(v[i + D].0, bits)) });
-                prefetch(unsafe { tab.as_ptr().add(thash(v[i + D].1, bits)) });
-            }
-            let (a, b) = v[i];
-            let ia = ins(&mut tab, mask, thash(a, bits), a, &mut keys, &mut parent);
-            let ib = ins(&mut tab, mask, thash(b, bits), b, &mut keys, &mut parent);
-            let ra = find(&mut parent, ia);
-            let rb = find(&mut parent, ib);
-            if ra != rb {
-                if ra < rb {
-                    parent[rb as usize] = ra;
-                } else {
-                    parent[ra as usize] = rb;
-                }
+    for i in 0..m {
+        let ra = find(&mut parent, side[2 * i]);
+        let rb = find(&mut parent, side[2 * i + 1]);
+        if ra != rb {
+            if ra < rb {
+                parent[rb as usize] = ra;
+            } else {
+                parent[ra as usize] = rb;
             }
         }
     }
-    let n = keys.len();
-    let t_union = tb.elapsed().as_secs_f64();
-    let mut minkey: Vec<u64> = vec![0; n];
+    drop(side);
+    // Person name per component: byte-wise smallest key (numeric order for exact keys).
+    let fallback = keys.iter().any(|&k| k & FB != 0);
+    let mut name: Vec<u64> = keys.clone();
     for i in 0..n {
         let r = find(&mut parent, i as u32);
         parent[i] = r;
-        let cur = minkey[r as usize];
-        if cur == 0 || key_lt(keys[i], cur) {
-            minkey[r as usize] = keys[i];
+        let k = keys[i];
+        let cur = unsafe { name.get_unchecked_mut(r as usize) };
+        if if fallback { key_lt(k, *cur) } else { k < *cur } {
+            *cur = k;
         }
     }
-    // Counting sort of (key, person) by part3(key).
-    let mut off = vec![0u32; NP3 + 1];
-    for &k in &keys {
-        off[part3(k) + 1] += 1;
-    }
-    for i in 0..NP3 {
-        off[i + 1] += off[i];
-    }
-    let mut fill = off.clone();
-    let mut ent = vec![(0u64, 0u64); n];
-    for i in 0..n {
-        let k = keys[i];
-        let q = part3(k);
-        ent[fill[q] as usize] = (k, minkey[parent[i] as usize]);
-        fill[q] += 1;
-    }
-    drop(tab);
-    eprintln!("  links: {m} pairs, {n} keys, union {t_union:.3}s total {:.3}s", tb.elapsed().as_secs_f64());
+    let t_union = tb.elapsed().as_secs_f64();
+    let ent: Vec<(u64, u64)> = (0..n).map(|i| (keys[i], name[parent[i] as usize])).collect();
+    eprintln!(
+        "  links: {m} pairs, {n} keys, dedup {t_dedup:.3}s union {:.3}s total {:.3}s",
+        t_union - t_dedup,
+        tb.elapsed().as_secs_f64()
+    );
     LinkParts { off, ent }
 }
 
@@ -928,57 +947,44 @@ fn links_chunk(buf: &[u8], start: usize, end: usize, m: &mut Masks) -> Vec<(u64,
 #[inline(never)]
 fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, out: &mut Scatter<ERec>, pool: &mut Pool) {
     let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
+    const VIEW: u32 = u32::from_le_bytes(*b"view");
+    const CART: u32 = u32::from_le_bytes(*b"cart");
+    const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     for_lines::<7>(buf, start, end, m, |f| {
         if f[0].1 == f[0].0 {
             return;
         }
         let ekey = pack_noreg(buf, f[0].0, f[0].1);
         let ingest = f1_field(buf, f[3].0, f[3].1).unwrap_or(i64::MAX / 4);
-        let ingest_s = (ingest.div_euclid(1000)).clamp(0, u32::MAX as i64) as u32;
-        let mut valid = true;
-        let ukey = if f[1].1 == f[1].0 {
-            valid = false;
-            0
-        } else {
-            pack_reg(buf, f[1].0, f[1].1)
+        let ingest_s = (ingest.max(0) / 1000).min(u32::MAX as i64) as u32;
+        let has_uid = f[1].1 != f[1].0;
+        let ukey = if has_uid { pack_reg(buf, f[1].0, f[1].1) } else { 0 };
+        let (ts, ts_ok) = match ts_at(buf, f[2].0, f[2].1) {
+            Some(t) => (t, (t >= ws) & (t < we)),
+            None => (0, false),
         };
-        let ts = match ts_at(buf, f[2].0, f[2].1) {
-            Some(t) if t >= ws && t < we => t,
-            _ => {
-                valid = false;
-                0
-            }
-        };
-        let ty = &buf[f[4].0..f[4].1];
-        let prod = &buf[f[5].0..f[5].1];
+        // event type as integers: view / cart (len 4) or purchase (len 8)
+        let tl = f[4].1 - f[4].0;
+        let w4 = if tl == 4 { rd32_at(buf, f[4].0) } else { 0 };
+        let vc = (w4 == VIEW) | (w4 == CART);
+        let pu = tl == 8 && rd64(buf, f[4].0) == PURCHASE;
+        let mut valid = has_uid & ts_ok & (vc | pu) & (f[5].1 != f[5].0) & (ingest - ts <= DAY);
         let mut meta = 0u32;
-        if prod.is_empty() {
-            valid = false;
-        }
-        match ty {
-            b"view" | b"cart" => {}
-            b"purchase" => {
-                if valid {
-                    match parse_price(&buf[f[6].0..f[6].1]) {
-                        Some(p) => {
-                            let cat = match ctx.products.get(prod) {
-                                Some(c) => c as u8,
-                                None => ctx.unknown_cat,
-                            };
-                            meta = p | (cat as u32) << 24;
-                        }
-                        None => valid = false,
-                    }
+        if pu & valid {
+            match parse_price(unsafe { buf.get_unchecked(f[6].0..f[6].1) }) {
+                Some(p) => {
+                    let prod = unsafe { buf.get_unchecked(f[5].0..f[5].1) };
+                    let cat = match ctx.products.get(prod) {
+                        Some(c) => c as u8,
+                        None => ctx.unknown_cat,
+                    };
+                    meta = p | (cat as u32) << 24;
                 }
+                None => valid = false,
             }
-            _ => valid = false,
-        }
-        if valid && ingest - ts > DAY {
-            valid = false;
         }
         let tsr = if valid { (ts - base) as u32 } else { u32::MAX };
-        let p = part1(ekey);
-        out.push(p, ERec { eid: ekey, uid: ukey, ingest: ingest_s, ts: tsr, meta }, pool);
+        out.push(part1(ekey), ERec { eid: ekey, uid: ukey, ingest: ingest_s, ts: tsr, meta }, pool);
     });
 }
 

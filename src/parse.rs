@@ -322,6 +322,11 @@ pub fn rd64(buf: &[u8], at: usize) -> u64 {
 }
 
 #[inline(always)]
+pub fn rd32_at(buf: &[u8], at: usize) -> u32 {
+    rd32(buf, at)
+}
+
+#[inline(always)]
 fn rd32(buf: &[u8], at: usize) -> u32 {
     debug_assert!(at + 4 <= buf.len());
     unsafe { (buf.as_ptr().add(at) as *const u32).read_unaligned() }
