@@ -513,7 +513,7 @@ fn main() {
         diag::run(&data, &outdir);
     }
     let knob = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
-    let chunk_size = knob("CHUNK_KB").map_or(256 << 10, |k| k << 10);
+    let chunk_size = knob("CHUNK_KB").map_or(128 << 10, |k| k << 10);
     let populate = knob("POPULATE").unwrap_or(0) == 1;
     let willneed = knob("WILLNEED").unwrap_or(0) == 1;
 
@@ -1023,70 +1023,75 @@ fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
     });
 }
 
-/// Per-thread dedup scratch. Table slots carry the partition's epoch, so the table is
-/// never cleared: a slot from an earlier partition reads as empty.
+/// Per-thread dedup scratch.
 struct Dedup {
-    table: Vec<u64>, // epoch << 48 | tag << 32 | index + 1
-    epoch: u64,
-    dead: Vec<u64>, // bit per record index: a copy that lost to another copy
+    table: Vec<u32>,  // tag << kbits | k + 1 (k = record number in the partition), 0 = empty
+    starts: Vec<u32>, // first record number of each slice
+    dead: Vec<u64>,   // bit per record number: a copy that lost to another copy
 }
 
 impl Dedup {
     fn new() -> Self {
-        Dedup { table: Vec::new(), epoch: 0, dead: Vec::new() }
+        Dedup { table: Vec::new(), starts: Vec::new(), dead: Vec::new() }
     }
 }
 
+/// Keeps, per event_id, the copy with the smallest ingest_ts and pushes the valid survivors.
+/// The table holds 4-byte slots (half the cache footprint of 8-byte ones); the record of a
+/// slot is found through `starts` only on a tag match, which is rare.
 #[inline(never)]
 fn dedup_partition(slices: &[(*const ERec, usize)], d: &mut Dedup, out: &mut Scatter<URec>, pool: &mut Pool) {
-    // record index = slice << 9 | offset (a block holds < 512 records)
-    const _: () = assert!(Scatter::<ERec>::CAP < 512);
     let n: usize = slices.iter().map(|s| s.1).sum();
     if n == 0 {
         return;
     }
-    assert!(slices.len() < 1 << 22, "too many blocks in one partition");
-    let at = |i: usize| -> ERec { unsafe { *slices.get_unchecked(i >> 9).0.add(i & 511) } };
+    assert!(n < 1 << 31, "partition too large");
+    let kbits = 64 - (n as u64).leading_zeros(); // k + 1 <= n fits
+    let tbits = 32 - kbits;
+    let kmask = if kbits == 32 { u32::MAX } else { (1u32 << kbits) - 1 };
     let cap = (2 * n).next_power_of_two().max(16);
     let bits = cap.trailing_zeros();
     let mask = cap - 1;
-    if d.table.len() < cap {
-        d.table.resize(cap, 0); // new slots have epoch 0: empty
+    d.table.clear();
+    d.table.resize(cap, 0);
+    d.starts.clear();
+    let mut acc = 0u32;
+    for &(_, len) in slices {
+        d.starts.push(acc);
+        acc += len as u32;
     }
-    d.epoch += 1;
-    if d.epoch == 1 << 16 {
-        d.table.iter_mut().for_each(|x| *x = 0);
-        d.epoch = 1;
-    }
-    let ep = d.epoch << 48;
     d.dead.clear();
-    d.dead.resize(slices.len() * 8, 0);
+    d.dead.resize(n.div_ceil(64), 0);
+    let starts = &d.starts;
+    let at = |k: usize| -> ERec {
+        let si = starts.partition_point(|&s| s as usize <= k) - 1;
+        unsafe { *slices.get_unchecked(si).0.add(k - starts[si] as usize) }
+    };
     let table = &mut d.table;
     let dead = &mut d.dead;
-    for (si, &(ptr, len)) in slices.iter().enumerate() {
+    let mut k = 0usize;
+    for &(ptr, len) in slices {
         for j in 0..len {
             let r = unsafe { *ptr.add(j) };
-            let i = si << 9 | j;
             let eid = r.eid;
-            let hv = eid.wrapping_mul(0xA076_1D64_78BD_642F);
-            let key = ep | (hv >> 48) << 32; // epoch and 16-bit tag
+            let tag = if tbits == 0 { 0 } else { ((eid.wrapping_mul(0xA076_1D64_78BD_642F) >> (64 - tbits)) as u32) << kbits };
             let mut h = thash(eid, bits);
             loop {
                 let slot = unsafe { *table.get_unchecked(h) };
-                if slot >> 48 != d.epoch {
-                    unsafe { *table.get_unchecked_mut(h) = key | (i as u64 + 1) };
+                if slot == 0 {
+                    unsafe { *table.get_unchecked_mut(h) = tag | (k as u32 + 1) };
                     break;
                 }
-                if slot & !0xFFFF_FFFF == key {
-                    let oi = (slot as u32 - 1) as usize;
-                    let o = at(oi);
+                if slot & !kmask == tag {
+                    let ok = ((slot & kmask) - 1) as usize;
+                    let o = at(ok);
                     if o.eid == eid {
                         // keep the smallest ingest_ts (equal ones are identical copies)
                         let lose = if r.ingest < o.ingest {
-                            unsafe { *table.get_unchecked_mut(h) = key | (i as u64 + 1) };
-                            oi
+                            unsafe { *table.get_unchecked_mut(h) = tag | (k as u32 + 1) };
+                            ok
                         } else {
-                            i
+                            k
                         };
                         unsafe { *dead.get_unchecked_mut(lose >> 6) |= 1u64 << (lose & 63) };
                         break;
@@ -1094,13 +1099,16 @@ fn dedup_partition(slices: &[(*const ERec, usize)], d: &mut Dedup, out: &mut Sca
                 }
                 h = (h + 1) & mask;
             }
+            k += 1;
         }
     }
     // survivors, read sequentially
-    for (si, &(ptr, len)) in slices.iter().enumerate() {
+    let mut k = 0usize;
+    for &(ptr, len) in slices {
         for j in 0..len {
-            let i = si << 9 | j;
-            if unsafe { *dead.get_unchecked(i >> 6) } >> (i & 63) & 1 != 0 {
+            let alive = unsafe { *dead.get_unchecked(k >> 6) } >> (k & 63) & 1 == 0;
+            k += 1;
+            if !alive {
                 continue;
             }
             let r = unsafe { *ptr.add(j) };
