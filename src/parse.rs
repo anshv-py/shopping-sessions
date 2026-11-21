@@ -91,12 +91,13 @@ pub fn parse_line<const N: usize>(buf: &[u8], mut i: usize, f: &mut [(usize, usi
 
 // ---------------------------------------------------------------- SIMD line walker
 
-/// Per-thread scratch for `for_lines`: comma, newline and quote bitmasks of one chunk.
+/// Per-thread scratch for `for_lines`: quote bitmask, delimiter positions and the
+/// newline flag of each delimiter (one bit per delimiter) of one chunk.
 #[derive(Default)]
 pub struct Masks {
     quo: Vec<u64>,
-    com: Vec<u64>,
-    nl: Vec<u64>,
+    pos: Vec<u32>,
+    nlf: Vec<u64>,
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -127,6 +128,26 @@ fn block3(p: &[u8; 64]) -> (u64, u64, u64) {
     (c, n, q)
 }
 
+/// Bits of x at the set positions of m, packed to the low end.
+#[inline(always)]
+fn pext64(x: u64, m: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_pext_u64(x, m)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let (mut r, mut m, mut k) = (0u64, m, 0);
+        while m != 0 {
+            let b = m.trailing_zeros();
+            r |= ((x >> b) & 1) << k;
+            k += 1;
+            m &= m - 1;
+        }
+        r
+    }
+}
+
 /// 128 bits of `v` starting at bit `a` (v must have 3 readable words past a >> 6).
 #[inline(always)]
 fn window(v: &[u64], a: usize) -> u128 {
@@ -143,48 +164,45 @@ fn window(v: &[u64], a: usize) -> u128 {
     }
 }
 
-/// Inclusive prefix XOR of the bits of x (bit i = xor of bits 0..=i).
-#[inline(always)]
-fn prefix_xor64(x: u64) -> u64 {
-    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
-    unsafe {
-        use std::arch::x86_64::*;
-        let r = _mm_clmulepi64_si128(_mm_set_epi64x(0, x as i64), _mm_set1_epi8(-1), 0);
-        _mm_cvtsi128_si64(r) as u64
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
-    {
-        let mut x = x;
-        x ^= x << 1;
-        x ^= x << 2;
-        x ^= x << 4;
-        x ^= x << 8;
-        x ^= x << 16;
-        x ^= x << 32;
-        x
-    }
+/// Number of set bits of v in [a, b).
+#[cold]
+#[inline(never)]
+fn range_pop(v: &[u64], a: usize, b: usize) -> u32 {
+    (a..b).filter(|&i| (v[i >> 6] >> (i & 63)) & 1 == 1).count() as u32
 }
 
-/// Quote rules for one line of length l (< 128) given its quote and comma bits: quotes
-/// come in pairs, each opening one at a field start and its partner at the same field's
-/// end, with no comma in between (simdjson-style pairing via prefix XOR).
+/// 64 bits of the bit stream `v` starting at bit `i` (v must have a readable word past).
 #[inline(always)]
-fn quotes_ok(qw: u128, commas: u128, l: usize) -> bool {
-    if qw.count_ones() & 1 == 1 {
-        return false;
+fn bits64(v: &[u64], i: usize) -> u64 {
+    let w = i >> 6;
+    let r = (i & 63) as u32;
+    let lo = unsafe { *v.get_unchecked(w) } >> r;
+    let hi = (unsafe { *v.get_unchecked(w + 1) } << 1) << (63 - r);
+    lo | hi
+}
+
+/// Index of the first set bit at or after bit `i` (one must exist).
+#[cold]
+#[inline(never)]
+fn next_set(v: &[u64], i: usize) -> usize {
+    let mut w = i >> 6;
+    let mut bits = v[w] & (!0u64 << (i & 63));
+    while bits == 0 {
+        w += 1;
+        bits = v[w];
     }
-    let lo = prefix_xor64(qw as u64);
-    let hi = prefix_xor64((qw >> 64) as u64) ^ (((lo >> 63) & 1).wrapping_neg());
-    let inside = (lo as u128) | ((hi as u128) << 64);
-    let opening = qw & inside;
-    let closing = qw & !inside;
-    let starts = (commas << 1) | 1;
-    let ends = (commas >> 1) | (1u128 << (l - 1));
-    (opening & !starts) == 0 && (closing & !ends) == 0 && (inside & commas) == 0
+    w * 64 + bits.trailing_zeros() as usize
 }
 
 /// Calls `cb` with the N fields (quotes stripped) of every well-formed line that starts
 /// in [start, end). Malformed lines (wrong field count, stray quotes, empty) are skipped.
+///
+/// Commas are always delimiters (a comma inside quotes makes the line malformed), so a
+/// well-formed line is exactly N-1 commas then a newline. Delimiter positions are first
+/// flattened into an array (with a parallel bit stream marking the newlines), so each
+/// line's fields are N consecutive entries. Quote rule: every field is either free of
+/// quotes or is `"` + quote-free text + `"`, i.e. the line's quote count equals twice the
+/// number of fields of length >= 2 that start and end with a quote.
 #[inline(always)]
 pub fn for_lines<const N: usize>(
     buf: &[u8],
@@ -200,85 +218,114 @@ pub fn for_lines<const N: usize>(
     }
     let e1 = if end >= len { len } else { skip_line(buf, end - 1) };
     let n = e1 - b0;
+    assert!(n < u32::MAX as usize - 64, "chunk too large");
     let words = n / 64 + 4;
-    m.com.clear();
-    m.com.resize(words, 0);
-    m.nl.clear();
-    m.nl.resize(words, 0);
     m.quo.clear();
     m.quo.resize(words, 0);
+    // room for every byte being a delimiter, plus the unconditional 16-entry writes
+    m.pos.clear();
+    m.pos.reserve(n + 80);
+    m.nlf.clear();
+    m.nlf.resize((n + 80) / 64 + 3, 0);
     let region = &buf[b0..e1];
     let full = n / 64;
+    let pos = m.pos.as_mut_ptr();
+    let nlf = &mut m.nlf;
+    let mut np = 0usize;
+    let mut block = |w: usize, blk: &[u8; 64], np: &mut usize| {
+        let (c, l, q) = block3(blk);
+        unsafe { *m.quo.get_unchecked_mut(w) = q };
+        let d = c | l;
+        let cnt = d.count_ones() as usize;
+        let base = (w * 64) as u32;
+        let p = unsafe { pos.add(*np) };
+        let mut bits = d;
+        for k in 0..8 {
+            unsafe { *p.add(k) = base + bits.trailing_zeros() };
+            bits &= bits.wrapping_sub(1);
+        }
+        if cnt > 8 {
+            for k in 8..16 {
+                unsafe { *p.add(k) = base + bits.trailing_zeros() };
+                bits &= bits.wrapping_sub(1);
+            }
+            let mut k = 16;
+            while bits != 0 {
+                unsafe { *p.add(k) = base + bits.trailing_zeros() };
+                bits &= bits - 1;
+                k += 1;
+            }
+        }
+        let fl = pext64(l, d);
+        let wi = *np >> 6;
+        let sh = (*np & 63) as u32;
+        unsafe {
+            *nlf.get_unchecked_mut(wi) |= fl << sh;
+            *nlf.get_unchecked_mut(wi + 1) |= (fl >> 1) >> (63 - sh);
+        }
+        *np += cnt;
+    };
     for w in 0..full {
         let blk: &[u8; 64] = region[w * 64..w * 64 + 64].try_into().unwrap();
-        let (c, l, q) = block3(blk);
-        m.com[w] = c;
-        m.nl[w] = l;
-        m.quo[w] = q;
+        block(w, blk, &mut np);
     }
     if n % 64 != 0 {
         let mut tmp = [0u8; 64];
         tmp[..n % 64].copy_from_slice(&region[full * 64..]);
-        let (c, l, q) = block3(&tmp);
-        m.com[full] = c;
-        m.nl[full] = l;
-        m.quo[full] = q;
+        block(full, &tmp, &mut np);
     }
     if region[n - 1] != b'\n' {
-        m.nl[n >> 6] |= 1u64 << (n & 63);
+        // the last line ends at the chunk end: a virtual newline there
+        unsafe { *pos.add(np) = n as u32 };
+        nlf[np >> 6] |= 1u64 << (np & 63);
+        np += 1;
     }
-    let com = &m.com;
-    let nl = &m.nl;
+    unsafe { m.pos.set_len(np) };
+    let pos = &m.pos;
+    let nlf = &m.nlf;
     let quo = &m.quo;
-    let mut w = 0usize;
-    let mut nbits = nl[0];
-    let mut ls = 0usize;
+    let want = 1u64 << (N - 1);
+    let fmask = (1u64 << N) - 1;
     let mut f = [(0usize, 0usize); N];
-    while ls < n {
-        while nbits == 0 {
-            w += 1;
-            nbits = unsafe { *nl.get_unchecked(w) };
-        }
-        let le = w * 64 + nbits.trailing_zeros() as usize;
-        nbits &= nbits - 1;
-        let l = le - ls;
-        let ok = if l < 128 {
-            let lm: u128 = (1u128 << l) - 1;
-            let commas = window(com, ls) & lm;
-            if commas.count_ones() as usize == N - 1 {
-                let mut cw = commas;
-                let mut prev = ls;
-                for fk in f.iter_mut().take(N - 1) {
-                    let p = ls + cw.trailing_zeros() as usize;
-                    cw &= cw - 1;
-                    *fk = (b0 + prev, b0 + p);
-                    prev = p + 1;
-                }
-                f[N - 1] = (b0 + prev, b0 + le);
-                let qw = window(quo, ls) & lm;
-                if qw == 0 {
-                    true
-                } else if quotes_ok(qw, commas, l) {
-                    // every quote pairs up around a whole field: strip them
-                    for fk in f.iter_mut() {
-                        let d = ((qw >> (fk.0 - b0 - ls)) & 1) as usize;
-                        *fk = (fk.0 + d, fk.1 - d);
-                    }
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
+    let mut i = 0usize;
+    let mut ls = 0usize;
+    while i < np {
+        let fl = bits64(nlf, i);
+        if fl & fmask == want {
+            // N-1 commas, then the newline
+            let le = unsafe { *pos.get_unchecked(i + N - 1) } as usize;
+            let mut prev = ls;
+            let mut pairs = 0u32;
+            for (k, fk) in f.iter_mut().enumerate() {
+                let p = unsafe { *pos.get_unchecked(i + k) } as usize;
+                let (s, e) = (b0 + prev, b0 + p);
+                // quoted field: length >= 2, first and last bytes are quotes
+                let long = e >= s + 2;
+                let first = unsafe { *buf.get_unchecked(if long { s } else { b0 }) };
+                let last = unsafe { *buf.get_unchecked(if long { e - 1 } else { b0 }) };
+                let d = (long & (first == b'"') & (last == b'"')) as usize;
+                pairs += d as u32;
+                *fk = (s + d, e - d);
+                prev = p + 1;
             }
+            let l = le - ls;
+            let quotes = if l < 128 {
+                (window(quo, ls) & ((1u128 << l) - 1)).count_ones()
+            } else {
+                range_pop(quo, ls, le)
+            };
+            // single call site, so the callback inlines into the loop
+            if quotes == 2 * pairs {
+                cb(&f);
+            }
+            i += N;
+            ls = le + 1;
         } else {
-            parse_line::<N>(&buf[..b0 + le], b0 + ls, &mut f).1
-        };
-        // single call site, so the callback inlines into the loop
-        if ok {
-            cb(&f);
+            // malformed: skip to the delimiter that ends the line
+            let k = if fl != 0 { i + fl.trailing_zeros() as usize } else { next_set(nlf, i) };
+            ls = unsafe { *pos.get_unchecked(k) } as usize + 1;
+            i = k + 1;
         }
-        ls = le + 1;
     }
 }
 
@@ -872,6 +919,80 @@ mod tests {
             if s.len() == 20 {
                 assert_eq!(f1_field(&buf, 0, 20, &mut dc), if s[19] == b'Z' { parse_ts(&s) } else { None });
             }
+        }
+    }
+
+    /// Reference: every line starting in [start, end) parsed with the scalar parse_line.
+    fn lines_ref<const N: usize>(buf: &[u8], start: usize, end: usize) -> Vec<Vec<(usize, usize)>> {
+        let mut out = Vec::new();
+        let mut i = chunk_begin(buf, start);
+        let mut f = [(0usize, 0usize); N];
+        while i < end && i < buf.len() {
+            let (next, ok) = parse_line::<N>(buf, i, &mut f);
+            if ok {
+                out.push(f.to_vec());
+            }
+            i = next;
+        }
+        out
+    }
+
+    fn walker_matches<const N: usize>(r: &mut Rng, m: &mut Masks) {
+        let alphabet: &[u8] = b"ab\",,,\n\"\r1";
+        let lim = if r.below(4) == 0 { 3000 } else { 300 };
+        let len = 1 + r.below(lim) as usize;
+        let mut buf: Vec<u8> = Vec::with_capacity(len + 64);
+        while buf.len() < len {
+            match r.below(10) {
+                // well-formed-ish line, with some quoted fields
+                0..=4 => {
+                    for k in 0..N {
+                        let q = r.below(3) == 0;
+                        if q {
+                            buf.push(b'"');
+                        }
+                        let flen = if r.below(8) == 0 { 140 } else { 6 };
+                        for _ in 0..r.below(flen) {
+                            buf.push(b"xyz09"[r.below(5) as usize]);
+                        }
+                        if q && r.below(10) != 0 {
+                            buf.push(b'"');
+                        }
+                        if k + 1 < N {
+                            buf.push(b',');
+                        }
+                    }
+                    buf.push(b'\n');
+                }
+                _ => buf.push(alphabet[r.below(alphabet.len() as u64) as usize]),
+            }
+        }
+        // random chunk boundaries, as the pipeline uses them
+        let cuts = 1 + r.below(4) as usize;
+        let mut bounds: Vec<usize> = (0..cuts - 1).map(|_| r.below(buf.len() as u64) as usize).collect();
+        bounds.push(0);
+        bounds.push(buf.len());
+        bounds.sort();
+        for w in bounds.windows(2) {
+            let (s, e) = (w[0], w[1]);
+            if s == e {
+                continue;
+            }
+            let mut got: Vec<Vec<(usize, usize)>> = Vec::new();
+            for_lines::<N>(&buf, s, e, m, |f| got.push(f.to_vec()));
+            let want = lines_ref::<N>(&buf, s, e);
+            assert_eq!(got, want, "N={N} chunk {s}..{e} of {:?}", String::from_utf8_lossy(&buf));
+        }
+    }
+
+    #[test]
+    fn walker_matches_scalar_parser() {
+        let mut r = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut m = Masks::default();
+        for _ in 0..40_000 {
+            walker_matches::<7>(&mut r, &mut m);
+            walker_matches::<3>(&mut r, &mut m);
+            walker_matches::<2>(&mut r, &mut m);
         }
     }
 
