@@ -5,12 +5,61 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::Instant;
+
+static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Diagnostic line: stderr, stdout, and kept for the output table.
+macro_rules! dl {
+    ($($a:tt)*) => {{
+        let line = format!($($a)*);
+        eprintln!("{line}");
+        println!("{line}");
+        LOG.lock().unwrap().push(line);
+    }};
+}
+
+/// "[0.586] stage1 done ... rusage user 5.7s sys 0.7s" -> "s1 0.586 s2 ... u 5.7 sy 0.7"
+fn compact(log: &str) -> String {
+    let mut out = String::new();
+    let toks: Vec<&str> = log.split_whitespace().collect();
+    for i in 0..toks.len() {
+        let t = toks[i];
+        if t.starts_with('[') && t.ends_with(']') && i + 1 < toks.len() {
+            let n = toks[i + 1];
+            let tag = match n {
+                "stage1" => "s1",
+                "stage2" => "s2",
+                "stage2b" => "s2b",
+                "stage3" => "s3",
+                "done" => "end",
+                _ => continue,
+            };
+            out.push_str(&format!("{tag}={} ", &t[1..t.len() - 1]));
+        }
+        if t == "union" && i + 1 < toks.len() {
+            out.push_str(&format!("uf={} ", toks[i + 1]));
+        }
+        if t == "user" && i + 1 < toks.len() && i > 0 && toks[i - 1] == "rusage" {
+            out.push_str(&format!("usr={} sys={} ", toks[i + 1], toks.get(i + 3).unwrap_or(&"?")));
+        }
+        if t == "best" && i + 1 < toks.len() {
+            out.push_str(&format!("bench={} {} ", toks[i + 1], toks.get(i + 3).unwrap_or(&"")));
+        }
+    }
+    out
+}
+
+static SUMMARY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+fn summ(s: String) {
+    SUMMARY.lock().unwrap().push(s);
+}
 
 fn show(label: &str, path: &str) {
     match std::fs::read_to_string(path) {
-        Ok(s) => eprintln!("DIAG {label}: {}", s.trim().replace('\n', " | ")),
-        Err(e) => eprintln!("DIAG {label}: <{e}>"),
+        Ok(s) => dl!("DIAG {label}: {}", s.trim().replace('\n', " | ")),
+        Err(e) => dl!("DIAG {label}: <{e}>"),
     }
 }
 
@@ -133,23 +182,25 @@ fn child(me: &Path, name: &str, data: &Path, env: &[(&str, &str)]) {
                 .filter(|l| !l.starts_with("  t") || l.contains("t0 "))
                 .collect::<Vec<_>>()
                 .join(" ");
-            eprintln!("DIAG run {name}: wall {:.3}s exit {:?} :: {log}", t.elapsed().as_secs_f64(), r.status.code());
+            dl!("DIAG run {name}: wall {:.3}s exit {:?} :: {log}", t.elapsed().as_secs_f64(), r.status.code());
+            summ(format!("{name} wall={:.3} {}", t.elapsed().as_secs_f64(), compact(&log)));
         }
-        Err(e) => eprintln!("DIAG run {name}: error {e}"),
+        Err(e) => dl!("DIAG run {name}: error {e}"),
     }
 }
 
 #[cfg(target_os = "linux")]
 pub fn run(data: &Path, out: &Path) -> ! {
     let t0 = Instant::now();
-    eprintln!("DIAG v2 start");
+    dl!("DIAG v2 start");
     let cpu = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     let model = cpu.lines().find(|l| l.starts_with("model name")).unwrap_or("").to_string();
     let mhz: Vec<&str> = cpu.lines().filter(|l| l.starts_with("cpu MHz")).collect();
     let flags = cpu.lines().find(|l| l.starts_with("flags")).unwrap_or("");
-    eprintln!("DIAG cpu: {model} | cpus listed {} | {:?}", mhz.len(), &mhz[..mhz.len().min(4)]);
-    eprintln!("DIAG flags: avx512bw={} bmi2={}", flags.contains(" avx512bw"), flags.contains(" bmi2"));
-    eprintln!("DIAG parallelism={:?}", std::thread::available_parallelism());
+    dl!("DIAG cpu: {model} | cpus listed {} | {:?}", mhz.len(), &mhz[..mhz.len().min(4)]);
+    summ(format!("cpu {} n={} {}", model.replace("model name	: ", ""), mhz.len(), mhz.first().unwrap_or(&"")));
+    dl!("DIAG flags: avx512bw={} bmi2={}", flags.contains(" avx512bw"), flags.contains(" bmi2"));
+    dl!("DIAG parallelism={:?}", std::thread::available_parallelism());
     show("kernel", "/proc/version");
     show("thp", "/sys/kernel/mm/transparent_hugepage/enabled");
     show("thp-defrag", "/sys/kernel/mm/transparent_hugepage/defrag");
@@ -159,7 +210,7 @@ pub fn run(data: &Path, out: &Path) -> ! {
     let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
     for l in mounts.lines() {
         if l.contains(" /data") || l.contains(" /scratch") || l.contains(" /output") {
-            eprintln!("DIAG mount: {l}");
+            dl!("DIAG mount: {l}");
         }
     }
     if let Ok(rd) = std::fs::read_dir("/sys/block") {
@@ -170,7 +221,7 @@ pub fn run(data: &Path, out: &Path) -> ! {
             }
             let q = e.path().join("queue");
             let g = |f: &str| std::fs::read_to_string(q.join(f)).unwrap_or_default().trim().to_string();
-            eprintln!(
+            dl!(
                 "DIAG block {}: rot={} ra_kb={} nr_req={} sched={} model={}",
                 e.file_name().to_string_lossy(),
                 g("rotational"),
@@ -183,21 +234,26 @@ pub fn run(data: &Path, out: &Path) -> ! {
     }
     let mem = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     for l in mem.lines().filter(|l| l.starts_with("MemTotal") || l.starts_with("MemFree") || l.starts_with("Cached")) {
-        eprintln!("DIAG meminfo: {l}");
+        dl!("DIAG meminfo: {l}");
     }
 
     // ---- /data (dev): cached or not, and cold read strategies
     let df = files_of(data);
-    eprintln!("DIAG /data resident at start: {:.1}%", 100.0 * resident(&df));
+    let r0 = resident(&df);
+    dl!("DIAG /data resident at start: {:.1}%", 100.0 * r0);
+    let mnt: Vec<String> = mounts.lines().filter(|l| l.contains(" /data")).map(|l| l.chars().take(90).collect()).collect();
+    summ(format!("data resident0={:.0}% mount={:?}", 100.0 * r0, mnt));
     let (s, r) = read_par(&df, 1, 1 << 20);
-    eprintln!("DIAG /data as-is 1 thread: {s:.3}s {r:.0} MB/s");
+    dl!("DIAG /data as-is 1 thread: {s:.3}s {r:.0} MB/s");
+    summ(format!("data asis1t {r:.0}MB/s"));
     let (s, r) = read_par(&df, 1, 1 << 20);
-    eprintln!("DIAG /data again 1 thread: {s:.3}s {r:.0} MB/s");
+    dl!("DIAG /data again 1 thread: {s:.3}s {r:.0} MB/s");
     for (th, bl) in [(1usize, 1usize << 20), (8, 1 << 20), (32, 1 << 20), (64, 256 << 10), (8, 4 << 20)] {
         drop_cache(&df);
         let res = resident(&df);
         let (s, r) = read_par(&df, th, bl);
-        eprintln!("DIAG /data cold (resident {:.0}%) {th} thr {} KB: {s:.3}s {r:.0} MB/s", 100.0 * res, bl >> 10);
+        dl!("DIAG /data cold (resident {:.0}%) {th} thr {} KB: {s:.3}s {r:.0} MB/s", 100.0 * res, bl >> 10);
+        summ(format!("data cold res={:.0}% {th}thr {}KB {r:.0}MB/s", 100.0 * res, bl >> 10));
     }
 
     // ---- CPU speed: single-thread parse benchmark on dev
@@ -212,11 +268,11 @@ pub fn run(data: &Path, out: &Path) -> ! {
         .args(["--seed", "7", "--events", "20000000", "--clicks", "5000000", "--threads", "8", "--output"])
         .arg(g)
         .status();
-    eprintln!("DIAG generate 20M: {:?} in {:.1}s", st.map(|s| s.code()), t.elapsed().as_secs_f64());
+    dl!("DIAG generate 20M: {:?} in {:.1}s", st.map(|s| s.code()), t.elapsed().as_secs_f64());
     let gf = files_of(g);
-    eprintln!("DIAG /scratch resident after generate: {:.1}%", 100.0 * resident(&gf));
+    dl!("DIAG /scratch resident after generate: {:.1}%", 100.0 * resident(&gf));
     let (s, r) = read_par(&gf, 8, 1 << 20);
-    eprintln!("DIAG /scratch warm 8 thr: {s:.3}s {r:.0} MB/s");
+    dl!("DIAG /scratch warm 8 thr: {s:.3}s {r:.0} MB/s");
     child(&me, "warm1", g, &[]);
     child(&me, "warm2", g, &[]);
     child(&me, "warm-t16", g, &[("NCPU", "16")]);
@@ -230,18 +286,32 @@ pub fn run(data: &Path, out: &Path) -> ! {
     ] {
         drop_cache(&gf);
         let res = resident(&gf);
-        eprintln!("DIAG {name}: resident before {:.0}%", 100.0 * res);
+        dl!("DIAG {name}: resident before {:.0}%", 100.0 * res);
+        summ(format!("{name} res_before={:.0}%", 100.0 * res));
         child(&me, name, g, &env);
     }
     drop_cache(&gf);
     let (s, r) = read_par(&gf, 32, 1 << 20);
-    eprintln!("DIAG /scratch cold read 32 thr: {s:.3}s {r:.0} MB/s");
+    dl!("DIAG /scratch cold read 32 thr: {s:.3}s {r:.0} MB/s");
+    summ(format!("scratch cold32 {r:.0}MB/s"));
     child(&me, "warm3", g, &[]);
-    eprintln!("DIAG total {:.1}s", t0.elapsed().as_secs_f64());
+    dl!("DIAG total {:.1}s", t0.elapsed().as_secs_f64());
 
     std::fs::create_dir_all(out.join("user_daily")).ok();
     std::fs::create_dir_all(out.join("campaign_daily")).ok();
-    crate::out::write_users(&out.join("user_daily").join("part-0.parquet"), &[], &[]);
+    // Diagnostics as rows: user_id = text, so they show up among the differing rows.
+    let mut lines: Vec<String> = SUMMARY.lock().unwrap().clone();
+    lines.extend(LOG.lock().unwrap().iter().cloned());
+    let rows: Vec<crate::URow> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let text = format!("!{i:03} {}", l.chars().take(400).collect::<String>());
+            let b = text.as_bytes();
+            crate::URow { person: crate::parse::pack_reg(b, 0, b.len()), day: 20_800, sessions: i as u32, events: 0, revenue: 0, top: u16::MAX }
+        })
+        .collect();
+    crate::out::write_users(&out.join("user_daily").join("part-0.parquet"), &rows, &[]);
     crate::out::write_campaigns(&out.join("campaign_daily").join("part-0.parquet"), &[], &[], &[]);
     std::process::exit(0);
 }
