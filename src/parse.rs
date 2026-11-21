@@ -286,16 +286,17 @@ pub fn for_lines<const N: usize>(
     m.qsf[0] = m.quo[0] & 1;
     m.qef[0] = 0;
     let mut np = 1usize;
-    let (quo, del, nl) = (&m.quo, &m.del, &m.nl);
-    let (nlf, qsf, qef) = (&mut m.nlf, &mut m.qsf, &mut m.qef);
+    // plain slices: their pointers stay in registers across the stores below
+    let (quo, del, nl): (&[u64], &[u64], &[u64]) = (&m.quo, &m.del, &m.nl);
+    let (nlf, qsf, qef): (&mut [u64], &mut [u64], &mut [u64]) = (&mut m.nlf, &mut m.qsf, &mut m.qef);
     let mut dprev = 1u64 << 63; // the virtual delimiter at -1
     let mut qprev = 0u64;
     for w in 0..=(n >> 6) {
-        let d = del[w];
-        let q = quo[w];
+        // w + 1 < words: in bounds
+        let (d, q, qn, l) = unsafe { (*del.get_unchecked(w), *quo.get_unchecked(w), *quo.get_unchecked(w + 1), *nl.get_unchecked(w)) };
         let qb = (q << 1) | (qprev >> 63); // quote just before
         let d2 = (d << 2) | (dprev >> 62); // delimiter two before
-        let qa = (q >> 1) | (quo[w + 1] << 63); // quote just after
+        let qa = (q >> 1) | (qn << 63); // quote just after
         dprev = d;
         qprev = q;
         if d == 0 {
@@ -321,15 +322,15 @@ pub fn for_lines<const N: usize>(
                 k += 1;
             }
         }
-        put_bits(nlf, np, pext64(nl[w], d));
+        put_bits(nlf, np, pext64(l, d));
         put_bits(qsf, np, pext64(qa, d));
         put_bits(qef, np, pext64(qb & !d2, d));
         np += cnt;
     }
     unsafe { m.pos.set_len(np) };
-    let pos = &m.pos;
-    let (nlf, qsf, qef) = (&m.nlf, &m.qsf, &m.qef);
-    let quo = &m.quo;
+    let pos: &[u32] = &m.pos;
+    let (nlf, qsf, qef): (&[u64], &[u64], &[u64]) = (&m.nlf, &m.qsf, &m.qef);
+    let quo: &[u64] = &m.quo;
     let want = 1u64 << (N - 1);
     let fmask = (1u64 << N) - 1;
     let mut f = [(0usize, 0usize); N];
@@ -661,7 +662,7 @@ const fn lane_mask(lanes: &[usize]) -> u64 {
 
 /// 8 ASCII digits (first digit in the lowest byte) to their value.
 #[inline(always)]
-fn parse8(v: u64) -> u64 {
+pub fn parse8(v: u64) -> u64 {
     let v = v.wrapping_sub(0x3030_3030_3030_3030);
     let v = v.wrapping_mul(10).wrapping_add(v >> 8);
     ((v & 0x0000_00FF_0000_00FF)
@@ -672,7 +673,7 @@ fn parse8(v: u64) -> u64 {
 
 /// True when every lane selected by `m` holds an ASCII digit.
 #[inline(always)]
-fn digits_ok(v: u64, m: u64) -> bool {
+pub fn digits_ok(v: u64, m: u64) -> bool {
     let hi = m & 0xF0F0_F0F0_F0F0_F0F0;
     let lo = m & 0x0F0F_0F0F_0F0F_0F0F;
     (v & hi) == (0x3030_3030_3030_3030 & m) && (((v & lo).wrapping_add(0x0606_0606_0606_0606 & m)) & hi) == 0
@@ -738,6 +739,7 @@ const TSM: u64 = lane_mask(&[2, 5]);
 const TS: u64 = (0x54u64 << 16) | (0x3Au64 << 40);
 
 /// `THH:MM` in b's lanes 2..8 -> (hour, minute), validated.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
 fn hm(b: u64) -> Option<(i64, i64)> {
     if (b & TSM) != TS || !digits_ok(b, TBM) {
@@ -753,7 +755,73 @@ fn hm(b: u64) -> Option<(i64, i64)> {
     Some((h, mi))
 }
 
+/// SSE time part of F1 / F2: the 16 bytes at s+4 are `-MM-DDTHH:MM:SS` plus one more byte
+/// (`Z` for F1, the offset sign for F2). Checks the separators (lane 15 only when `z`) and
+/// the month, day and time digits, and returns (h * 3600 + m * 60 + s, byte s+19).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn hms_simd(buf: &[u8], s: usize, z: bool) -> Option<i64> {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm_loadu_si128(buf.as_ptr().add(s + 4) as *const __m128i);
+        let t = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+        let dig = _mm_cmpeq_epi8(_mm_min_epu8(t, _mm_set1_epi8(9)), t);
+        let tmpl = _mm_setr_epi8(
+            b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0, b':' as i8, 0, 0, b'Z' as i8,
+        );
+        let sep = _mm_cmpeq_epi8(v, tmpl);
+        let sepm = _mm_setr_epi8(-128, 0, 0, -128, 0, 0, -128, 0, 0, -128, 0, 0, -128, 0, 0, -128);
+        let ok = _mm_movemask_epi8(_mm_blendv_epi8(dig, sep, sepm)) as u32;
+        let want = if z { 0xFFFF } else { 0x7FFF };
+        if ok & want != want {
+            return None;
+        }
+        // digit pairs (hour, minute, second) -> 10 * a + b in u16 lanes 0..3
+        let shuf = _mm_setr_epi8(7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+        let m = _mm_maddubs_epi16(_mm_shuffle_epi8(t, shuf), _mm_set1_epi16(0x010A));
+        let x = _mm_cvtsi128_si64(m) as u64;
+        let (h, mi, se) = ((x & 0xFFFF) as i64, ((x >> 16) & 0xFFFF) as i64, ((x >> 32) & 0xFFFF) as i64);
+        if (h > 23) | (mi > 59) | (se > 59) {
+            return None;
+        }
+        Some(h * 3600 + mi * 60 + se)
+    }
+}
+
 /// F1 `YYYY-MM-DDTHH:MM:SSZ` at buf[s..s+20].
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn f1_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
+    let t = hms_simd(buf, s, true)?;
+    let days = date_days(rd64(buf, s), rd64(buf, s + 8), dc)?;
+    Some((days * 86_400 + t) * 1000)
+}
+
+/// F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` at buf[s..s+25].
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn f2_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
+    let t = hms_simd(buf, s, false)?;
+    let x = rd64(buf, s + 17); // S S sign H H : M M
+    let sign = (x >> 16) & 0xFF;
+    if ((x >> 40) & 0xFF) != 0x3A || !digits_ok(x, lane_mask(&[3, 4, 6, 7])) || (sign != 0x2B && sign != 0x2D) {
+        return None;
+    }
+    let dx = x & 0x0F0F_0F0F_0F0F_0F0F;
+    let tx = dx.wrapping_mul(10).wrapping_add(dx >> 8);
+    let oh = ((tx >> 24) & 0xFF) as i64;
+    let om = ((tx >> 48) & 0xFF) as i64;
+    if (oh > 23) | (om > 59) {
+        return None;
+    }
+    let days = date_days(rd64(buf, s), rd64(buf, s + 8), dc)?;
+    let t = (days * 86_400 + t) * 1000;
+    let off = (oh * 60 + om) * 60_000;
+    Some(if sign == 0x2B { t - off } else { t + off })
+}
+
+/// F1 `YYYY-MM-DDTHH:MM:SSZ` at buf[s..s+20].
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
 fn f1_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
     let a = rd64(buf, s);
@@ -772,6 +840,7 @@ fn f1_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
 }
 
 /// F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` at buf[s..s+25].
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
 fn f2_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
     let a = rd64(buf, s);

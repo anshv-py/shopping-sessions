@@ -119,6 +119,8 @@ pub struct Lookup {
     prefix: &'static [u8],
     by_num: Vec<u16>,
     map: HashMap<Vec<u8>, u16>,
+    pmask: u64, // low bytes holding the prefix
+    pword: u64, // the prefix bytes
 }
 
 impl Lookup {
@@ -135,7 +137,34 @@ impl Lookup {
                 map.insert(k.clone(), *v);
             }
         }
-        Lookup { prefix, by_num, map }
+        assert!(prefix.len() <= 2);
+        let pmask = (1u64 << (8 * prefix.len())) - 1;
+        let pword = prefix.iter().rev().fold(0u64, |a, &b| a << 8 | b as u64);
+        Lookup { prefix, by_num, map, pmask, pword }
+    }
+    /// `get(&buf[s..e])` with the canonical `prefix + digits` case done in one 8-byte load.
+    #[inline(always)]
+    fn get_at(&self, buf: &[u8], s: usize, e: usize) -> Option<u16> {
+        let p = self.prefix.len();
+        let l = e - s;
+        if l > p && l <= p + 6 && s + 8 <= buf.len() {
+            let w = rd64(buf, s);
+            let nd = l - p; // 1..=6 digits
+            let dw = w >> (8 * p);
+            let lanes = (1u64 << (8 * nd)) - 1;
+            let canonical = (w & self.pmask) == self.pword
+                && digits_ok(dw, lanes)
+                && !(nd > 1 && dw & 0xFF == b'0' as u64);
+            if canonical {
+                let v = ((dw & lanes) << (8 * (8 - nd))) | (0x3030_3030_3030_3030u64 >> (8 * nd));
+                return match self.by_num.get(parse8(v) as usize) {
+                    Some(&v) if v != u16::MAX => Some(v),
+                    _ => None,
+                };
+            }
+            return if self.map.is_empty() { None } else { self.map.get(&buf[s..e]).copied() };
+        }
+        self.get(&buf[s..e])
     }
     #[inline(always)]
     fn get(&self, s: &[u8]) -> Option<u16> {
@@ -207,12 +236,13 @@ unsafe impl<T: Copy> Sync for Scatter<T> {}
 impl<T: Copy> Scatter<T> {
     const CAP: usize = BLOCK_BYTES / std::mem::size_of::<T>();
     fn new(np: usize) -> Self {
-        Scatter { cur: vec![(std::ptr::null_mut(), 0); np], blocks: (0..np).map(|_| Vec::new()).collect() }
+        // (null, CAP): "full", so the first push takes a block through the one check below
+        Scatter { cur: vec![(std::ptr::null_mut(), Self::CAP as u32); np], blocks: (0..np).map(|_| Vec::new()).collect() }
     }
     #[inline(always)]
     fn push(&mut self, p: usize, v: T, pool: &mut Pool) {
         let c = unsafe { self.cur.get_unchecked_mut(p) };
-        if c.1 as usize == Self::CAP || c.0.is_null() {
+        if c.1 as usize == Self::CAP {
             if !c.0.is_null() {
                 unsafe { self.blocks.get_unchecked_mut(p) }.push(c.0);
             }
@@ -989,8 +1019,7 @@ fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
         if pu & valid {
             match parse_price(unsafe { buf.get_unchecked(f[6].0..f[6].1) }) {
                 Some(p) => {
-                    let prod = unsafe { buf.get_unchecked(f[5].0..f[5].1) };
-                    let cat = match ctx.products.get(prod) {
+                    let cat = match ctx.products.get_at(buf, f[5].0, f[5].1) {
                         Some(c) => c as u8,
                         None => ctx.unknown_cat,
                     };
@@ -1016,7 +1045,7 @@ fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
             Some(t) if t >= lo && t < hi => t,
             _ => return,
         };
-        let Some(camp) = ctx.campaigns.get(&buf[f[2].0..f[2].1]) else { return };
+        let Some(camp) = ctx.campaigns.get_at(buf, f[2].0, f[2].1) else { return };
         let ckey = pack_reg(buf, f[0].0, f[0].1);
         let uid = pack_reg(buf, f[1].0, f[1].1);
         out.push(part3(uid), C1 { uid, ckey, ts: (ts - ctx.base) as u32, camp: camp as u32 }, pool);
@@ -1474,5 +1503,54 @@ impl Stage3 {
         self.touched.clear();
         let t = if top == u16::MAX { None } else { Some(top as u8) };
         self.cols.push(&mut self.pool, person, day as i32, sessions, events, revenue, t);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_get_at_matches_get() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for prefix in [&b"c_"[..], &b"p"[..]] {
+            let p: &'static [u8] = if prefix.len() == 2 { b"c_" } else { b"p" };
+            let mut entries: Vec<(Vec<u8>, u16)> = Vec::new();
+            for i in 0..3000u16 {
+                let mut k = p.to_vec();
+                k.extend_from_slice(rnd(1_000_000).to_string().as_bytes());
+                if i % 50 == 0 {
+                    k.push(b'x'); // non-canonical ids go to the map
+                }
+                entries.push((k, i));
+            }
+            let lk = Lookup::new(p, &entries);
+            for _ in 0..200_000 {
+                let mut s: Vec<u8> = Vec::new();
+                let choice = rnd(4);
+                if choice == 0 {
+                    s = entries[rnd(entries.len() as u64) as usize].0.clone();
+                } else {
+                    if rnd(5) != 0 {
+                        s.extend_from_slice(p);
+                    }
+                    for _ in 0..rnd(9) {
+                        s.push(b"0123456789c_px"[rnd(14) as usize]);
+                    }
+                }
+                let tail = rnd(10) as usize;
+                let mut buf = s.clone();
+                for _ in 0..tail {
+                    buf.push(b"01,x"[rnd(4) as usize]);
+                }
+                assert_eq!(lk.get_at(&buf, 0, s.len()), lk.get(&s), "{:?}", String::from_utf8_lossy(&s));
+            }
+        }
     }
 }

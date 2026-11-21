@@ -223,6 +223,12 @@ def main():
 
     os.makedirs(out, exist_ok=True)
 
+    def csv_field(v):
+        # quote ids holding CSV specials (a raw CR inside an id would otherwise split the row)
+        if any(c in v for c in ',"\r\n'):
+            return '"' + v.replace('"', '""') + '"'
+        return v
+
     def date(d):
         return datetime.fromtimestamp(d * 86400, tz=timezone.utc).strftime("%Y-%m-%d")
 
@@ -232,7 +238,7 @@ def main():
             top = ""
             if cats:
                 top = sorted(cats.items(), key=lambda kv: (-kv[1], kv[0].encode()))[0][0]
-            fo.write(f"{who},{date(day)},{n},{ne},{rev},{top}\n")
+            fo.write(f"{csv_field(who)},{date(day)},{n},{ne},{rev},{top}\n")
     with open(os.path.join(out, "campaign_daily.csv"), "w", encoding="utf-8", newline="") as fo:
         fo.write("campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n")
         for (camp, day), (n, pu, rev, ass) in cd.items():
