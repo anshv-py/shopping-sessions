@@ -597,15 +597,17 @@ const SC: u64 = 0x3A | (0x5Au64 << 24);
 
 // Per-thread cache of the date part (`YYYY-MM-DD`) -> days since epoch. Timestamps in a
 // dataset fall within a few weeks, so nearly every lookup hits.
-struct DayCache {
+/// Each parsing thread owns one; passed explicitly so lookups inline.
+pub struct DayCache {
     a: [u64; 64],
     dd: [u32; 64],
     days: [i32; 64],
 }
 
-thread_local! {
-    static DC: std::cell::UnsafeCell<DayCache> =
-        const { std::cell::UnsafeCell::new(DayCache { a: [0; 64], dd: [0; 64], days: [i32::MIN; 64] }) };
+impl Default for DayCache {
+    fn default() -> Self {
+        DayCache { a: [0; 64], dd: [0; 64], days: [i32::MIN; 64] }
+    }
 }
 
 const DMA: u64 = lane_mask(&[0, 1, 2, 3, 5, 6]);
@@ -630,21 +632,18 @@ fn date_slow(a: u64, dd: u64) -> Option<i64> {
 
 /// Days since epoch of the date in `a` (bytes 0..8) and the low two bytes of `b`.
 #[inline(always)]
-fn date_days(a: u64, b: u64) -> Option<i64> {
+fn date_days(a: u64, b: u64, c: &mut DayCache) -> Option<i64> {
     let dd = b & 0xFFFF;
     let idx = ((dd ^ (dd >> 6) ^ (a >> 40)) & 63) as usize;
-    DC.with(|c| {
-        let c = unsafe { &mut *c.get() };
-        if c.a[idx] == a && c.dd[idx] == dd as u32 {
-            let v = c.days[idx];
-            return if v == i32::MIN { None } else { Some(v as i64) };
-        }
-        let v = date_slow(a, dd);
-        c.a[idx] = a;
-        c.dd[idx] = dd as u32;
-        c.days[idx] = v.map_or(i32::MIN, |x| x as i32);
-        v
-    })
+    if c.a[idx] == a && c.dd[idx] == dd as u32 {
+        let v = c.days[idx];
+        return if v == i32::MIN { None } else { Some(v as i64) };
+    }
+    let v = date_slow(a, dd);
+    c.a[idx] = a;
+    c.dd[idx] = dd as u32;
+    c.days[idx] = v.map_or(i32::MIN, |x| x as i32);
+    v
 }
 
 const TBM: u64 = lane_mask(&[3, 4, 6, 7]);
@@ -669,7 +668,7 @@ fn hm(b: u64) -> Option<(i64, i64)> {
 
 /// F1 `YYYY-MM-DDTHH:MM:SSZ` at buf[s..s+20].
 #[inline(always)]
-fn f1_at(buf: &[u8], s: usize) -> Option<i64> {
+fn f1_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
     let a = rd64(buf, s);
     let b = rd64(buf, s + 8);
     let c = rd32(buf, s + 16) as u64;
@@ -681,13 +680,13 @@ fn f1_at(buf: &[u8], s: usize) -> Option<i64> {
     if se > 59 {
         return None;
     }
-    let days = date_days(a, b)?;
+    let days = date_days(a, b, dc)?;
     Some((days * 86_400 + h * 3600 + mi * 60 + se) * 1000)
 }
 
 /// F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` at buf[s..s+25].
 #[inline(always)]
-fn f2_at(buf: &[u8], s: usize) -> Option<i64> {
+fn f2_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
     let a = rd64(buf, s);
     let b = rd64(buf, s + 8);
     let x = rd64(buf, s + 17); // S S sign H H : M M
@@ -707,7 +706,7 @@ fn f2_at(buf: &[u8], s: usize) -> Option<i64> {
     if (se > 59) | (oh > 23) | (om > 59) {
         return None;
     }
-    let days = date_days(a, b)?;
+    let days = date_days(a, b, dc)?;
     let t = (days * 86_400 + h * 3600 + mi * 60 + se) * 1000;
     let off = (oh * 60 + om) * 60_000;
     Some(if sign == 0x2B { t - off } else { t + off })
@@ -741,25 +740,25 @@ fn f3_at(buf: &[u8], s: usize, e: usize) -> Option<i64> {
 
 /// Event/click `ts` of buf[s..e]; falls back to `parse_ts` off the fast paths.
 #[inline(always)]
-pub fn ts_at(buf: &[u8], s: usize, e: usize) -> Option<i64> {
+pub fn ts_at(buf: &[u8], s: usize, e: usize, dc: &mut DayCache) -> Option<i64> {
     let len = e - s;
     if len == 20 && buf[s + 19] == b'Z' {
-        return f1_at(buf, s);
+        return f1_at(buf, s, dc);
     }
     if len >= 1 && len <= 16 && s + 16 <= buf.len() && buf[s].wrapping_sub(b'0') < 10 {
         return f3_at(buf, s, e);
     }
     if len == 25 {
-        return f2_at(buf, s);
+        return f2_at(buf, s, dc);
     }
     parse_ts(&buf[s..e])
 }
 
 /// ingest_ts (always F1).
 #[inline(always)]
-pub fn f1_field(buf: &[u8], s: usize, e: usize) -> Option<i64> {
+pub fn f1_field(buf: &[u8], s: usize, e: usize, dc: &mut DayCache) -> Option<i64> {
     if e - s == 20 && buf[s + 19] == b'Z' {
-        f1_at(buf, s)
+        f1_at(buf, s, dc)
     } else {
         None
     }
@@ -858,6 +857,7 @@ mod tests {
     #[test]
     fn swar_timestamps_match_reference() {
         let mut r = Rng(0x1234_5678_9abc_def1);
+        let mut dc = DayCache::default();
         for _ in 0..3_000_000 {
             let s = candidates(&mut r);
             // embed with random tails so over-reads see junk
@@ -866,11 +866,11 @@ mod tests {
             for _ in 0..tail {
                 buf.push(b"0123456789Z,\n"[r.below(13) as usize]);
             }
-            let fast = ts_at(&buf, 0, s.len());
+            let fast = ts_at(&buf, 0, s.len(), &mut dc);
             let slow = parse_ts(&s);
             assert_eq!(fast, slow, "{:?}", String::from_utf8_lossy(&s));
             if s.len() == 20 {
-                assert_eq!(f1_field(&buf, 0, 20), if s[19] == b'Z' { parse_ts(&s) } else { None });
+                assert_eq!(f1_field(&buf, 0, 20, &mut dc), if s[19] == b'Z' { parse_ts(&s) } else { None });
             }
         }
     }

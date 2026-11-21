@@ -30,6 +30,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+#[cfg(target_os = "linux")]
+fn mem_mb() -> usize {
+    bump::used() >> 20
+}
+#[cfg(not(target_os = "linux"))]
+fn mem_mb() -> usize {
+    0
+}
+
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
 pub const GAP: i64 = 1_800_000;
@@ -165,7 +174,7 @@ fn fast_num(prefix: &[u8], s: &[u8]) -> Option<usize> {
     Some(n)
 }
 
-const BLOCK_BYTES: usize = 8192;
+pub const BLOCK_BYTES: usize = 8192;
 
 /// Per-thread pool of free 8 KiB blocks. Blocks of consumed partitions are recycled into
 /// it, so later stages mostly write into memory that is already faulted in.
@@ -174,11 +183,11 @@ pub struct Pool {
 }
 
 impl Pool {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Pool { free: Vec::with_capacity(1 << 16) }
     }
     #[inline(always)]
-    fn get(&mut self) -> *mut u8 {
+    pub fn get(&mut self) -> *mut u8 {
         match self.free.pop() {
             Some(b) => b,
             None => unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align_unchecked(BLOCK_BYTES, 64)) },
@@ -602,6 +611,7 @@ fn main() {
         let reps = knob("REPS").unwrap_or(7);
         let mut pool = Pool::new();
         let mut bm = Masks::default();
+        let mut dc = DayCache::default();
         let mut best = f64::MAX;
         for _ in 0..reps {
             let mut sc: Scatter<ERec> = Scatter::new(NP1);
@@ -617,20 +627,20 @@ fn main() {
                     });
                 } else if mode == "ts" {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
-                        acc += ts_at(buf, f[2].0, f[2].1).unwrap_or(1) as usize
-                            + f1_field(buf, f[3].0, f[3].1).unwrap_or(1) as usize
+                        acc += ts_at(buf, f[2].0, f[2].1, &mut dc).unwrap_or(1) as usize
+                            + f1_field(buf, f[3].0, f[3].1, &mut dc).unwrap_or(1) as usize
                     });
                 } else if mode == "ing" {
-                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += f1_field(buf, f[3].0, f[3].1).unwrap_or(1) as usize);
+                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += f1_field(buf, f[3].0, f[3].1, &mut dc).unwrap_or(1) as usize);
                 } else if mode == "tsonly" {
-                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += ts_at(buf, f[2].0, f[2].1).unwrap_or(1) as usize);
+                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += ts_at(buf, f[2].0, f[2].1, &mut dc).unwrap_or(1) as usize);
                 } else if mode == "push" {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
                         let k = f[0].0 as u64 * 0x9E37_79B9_7F4A_7C15;
                         sc.push(part1(k), ERec { eid: k, uid: f[1].0 as u64, ingest: 0, ts: 0, meta: 0 }, &mut pool)
                     });
                 } else {
-                    events_chunk(buf, c.start, c.end, &ctx, &mut bm, &mut sc, &mut pool);
+                    events_chunk(buf, c.start, c.end, &ctx, &mut bm, &mut dc, &mut sc, &mut pool);
                 }
             }
             best = best.min(t.elapsed().as_secs_f64());
@@ -675,132 +685,6 @@ fn main() {
     if n_link_chunks == 0 {
         let _ = link_parts.set(LinkParts { off: vec![0; NP3 + 1], ent: Vec::new() });
     }
-    let next = AtomicUsize::new(0);
-
-    // ---------------- stage 1: parse ----------------
-    let s1: Vec<S1Out> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..nthreads)
-            .map(|_| {
-                sc.spawn(|| {
-                    let mut o = S1Out { ev: Scatter::new(NP1), cl: Scatter::new(NP3) };
-                    let mut pool = Pool::new();
-                    let mut masks = Masks::default();
-                    let mut rbuf: Vec<u8> = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(c) = chunks.get(i) else { break };
-                        let whole: &[u8] = &maps[c.kind as usize][c.file];
-                        let (buf, cs, ce): (&[u8], usize, usize) = if use_read {
-                            let (a, b) = load_chunk(&files[c.kind as usize][c.file], whole.len(), c.start, c.end, &mut rbuf);
-                            (&rbuf[..], a, b)
-                        } else {
-                            (whole, c.start, c.end)
-                        };
-                        let c = Chunk { kind: c.kind, file: c.file, start: cs, end: ce };
-                        #[cfg(target_os = "linux")]
-                        if populate {
-                            let p = buf.as_ptr() as usize + c.start;
-                            let a = p & !4095;
-                            unsafe { libc::madvise(a as *mut libc::c_void, c.end - c.start + (p - a), 22) };
-                        }
-                        match c.kind {
-                            0 => {
-                                let v = links_chunk(buf, c.start, c.end, &mut masks);
-                                link_pairs.lock().unwrap().push(v);
-                                if links_done.fetch_add(1, Ordering::AcqRel) + 1 == n_link_chunks {
-                                    let pairs = std::mem::take(&mut *link_pairs.lock().unwrap());
-                                    let lp = build_links(&pairs);
-                                    let _ = link_parts.set(lp);
-                                    link_ready_ms.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
-                                }
-                            }
-                            1 => events_chunk(buf, c.start, c.end, &ctx, &mut masks, &mut o.ev, &mut pool),
-                            _ => clicks_chunk(buf, c.start, c.end, &ctx, &mut masks, &mut o.cl, &mut pool),
-                        }
-                    }
-                    o
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let link_parts = link_parts.into_inner().unwrap();
-    eprintln!("[{:.3}] stage1 done (link map ready at {} ms)", t0.elapsed().as_secs_f64(), link_ready_ms.load(Ordering::Relaxed));
-
-    // ---------------- stage 2: dedup, scatter by user_id ----------------
-    let next = AtomicUsize::new(0);
-    let s2: Vec<S2Out> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..nthreads)
-            .map(|_| {
-                sc.spawn(|| {
-                    let mut o = S2Out { uv: Scatter::new(NP3) };
-                    let mut pool = Pool::new();
-                    let mut local: Vec<ERec> = Vec::new();
-                    let mut table: Vec<u64> = Vec::new();
-                    loop {
-                        let p = next.fetch_add(1, Ordering::Relaxed);
-                        if p >= NP1 {
-                            break;
-                        }
-                        local.clear();
-                        for t in &s1 {
-                            t.ev.each(p, |sl| local.extend_from_slice(sl));
-                            t.ev.recycle(p, &mut pool);
-                        }
-                        dedup_partition(&local, &mut table, &mut o.uv, &mut pool);
-                    }
-                    o
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    eprintln!("[{:.3}] stage2 done", t0.elapsed().as_secs_f64());
-
-    // ---------------- stage 2b: resolve persons per user_id partition ----------------
-    let next = AtomicUsize::new(0);
-    let s2b: Vec<S2bOut> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..nthreads)
-            .map(|_| {
-                sc.spawn(|| {
-                    let mut o = S2bOut { pv: Scatter::new(NP2), cv: Scatter::new(NP2) };
-                    let mut pool = Pool::new();
-                    let mut lm = LocalMap::new();
-                    loop {
-                        let p = next.fetch_add(1, Ordering::Relaxed);
-                        if p >= NP3 {
-                            break;
-                        }
-                        let ent = &link_parts.ent[link_parts.off[p] as usize..link_parts.off[p + 1] as usize];
-                        lm.load(ent);
-                        for t in &s2 {
-                            t.uv.each(p, |sl| {
-                                for r in sl {
-                                    let person = lm.get(r.uid);
-                                    o.pv.push(part2(person), PRec { person, tm: r.tm }, &mut pool);
-                                }
-                            });
-                            t.uv.recycle(p, &mut pool);
-                        }
-                        for t in &s1 {
-                            t.cl.each(p, |sl| {
-                                for r in sl {
-                                    let person = lm.get(r.uid);
-                                    o.cv.push(part2(person), CRec { person, ckey: r.ckey, ts: r.ts, camp: r.camp }, &mut pool);
-                                }
-                            });
-                            t.cl.recycle(p, &mut pool);
-                        }
-                    }
-                    o
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    eprintln!("[{:.3}] stage2b done", t0.elapsed().as_secs_f64());
-
-    // ---------------- stage 3: sessions ----------------
     let ud = outdir.join("user_daily");
     let cd = outdir.join("campaign_daily");
     std::fs::create_dir_all(&ud).expect("mkdir user_daily");
@@ -808,36 +692,168 @@ fn main() {
     let day0 = base.div_euclid(DAY);
     let nd = ((we - 1).div_euclid(DAY) - day0 + 1).max(1) as usize;
     let ncs = ncamp + 1; // + organic
-    let next = AtomicUsize::new(0);
     let wrote_any = AtomicUsize::new(0);
-    let cat_names_ref = &cat_names;
-    let cat_rank_ref = &cat_rank;
+
+    // One set of workers runs every stage, separated by barriers, so each thread keeps its
+    // block pool (and allocator slab) from stage to stage: blocks of consumed partitions
+    // are reused by later stages instead of touching fresh memory.
+    let barrier = std::sync::Barrier::new(nthreads);
+    let next1 = AtomicUsize::new(0);
+    let next2 = AtomicUsize::new(0);
+    let next2b = AtomicUsize::new(0);
+    let next3 = AtomicUsize::new(0);
+    let s1v: Vec<OnceLock<S1Out>> = (0..nthreads).map(|_| OnceLock::new()).collect();
+    let s2v: Vec<OnceLock<S2Out>> = (0..nthreads).map(|_| OnceLock::new()).collect();
+    let s2bv: Vec<OnceLock<S2bOut>> = (0..nthreads).map(|_| OnceLock::new()).collect();
     let stats: Vec<Vec<[i64; 4]>> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nthreads)
             .map(|tid| {
-                let s2b = &s2b;
-                let next = &next;
-                let ud = &ud;
-                let wrote_any = &wrote_any;
-                let ctx = &ctx;
+                let (barrier, next1, next2, next2b, next3) = (&barrier, &next1, &next2, &next2b, &next3);
+                let (s1v, s2v, s2bv) = (&s1v, &s2v, &s2bv);
+                let (chunks, maps, files, ctx) = (&chunks, &maps, &files, &ctx);
+                let (link_pairs, links_done, link_parts, link_ready_ms) = (&link_pairs, &links_done, &link_parts, &link_ready_ms);
+                let (ud, wrote_any, cat_names, cat_rank) = (&ud, &wrote_any, &cat_names, &cat_rank);
                 sc.spawn(move || {
-                    let mut st = Stage3::new(ncamp, nd, cat_names_ref.len(), day0, ctx.base);
+                    let mut pool = Pool::new();
+                    // ---------------- stage 1: parse ----------------
+                    {
+                        let mut o = S1Out { ev: Scatter::new(NP1), cl: Scatter::new(NP3) };
+                        let mut masks = Masks::default();
+                        let mut dc = DayCache::default();
+                        let mut rbuf: Vec<u8> = Vec::new();
+                        loop {
+                            let i = next1.fetch_add(1, Ordering::Relaxed);
+                            let Some(c) = chunks.get(i) else { break };
+                            let whole: &[u8] = &maps[c.kind as usize][c.file];
+                            let (buf, cs, ce): (&[u8], usize, usize) = if use_read {
+                                let (a, b) = load_chunk(&files[c.kind as usize][c.file], whole.len(), c.start, c.end, &mut rbuf);
+                                (&rbuf[..], a, b)
+                            } else {
+                                (whole, c.start, c.end)
+                            };
+                            #[cfg(target_os = "linux")]
+                            if populate {
+                                let p = buf.as_ptr() as usize + cs;
+                                let a = p & !4095;
+                                unsafe { libc::madvise(a as *mut libc::c_void, ce - cs + (p - a), 22) };
+                            }
+                            match c.kind {
+                                0 => {
+                                    let v = links_chunk(buf, cs, ce, &mut masks);
+                                    link_pairs.lock().unwrap().push(v);
+                                    if links_done.fetch_add(1, Ordering::AcqRel) + 1 == n_link_chunks {
+                                        let pairs = std::mem::take(&mut *link_pairs.lock().unwrap());
+                                        let lp = build_links(&pairs);
+                                        let _ = link_parts.set(lp);
+                                        link_ready_ms.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
+                                    }
+                                }
+                                1 => events_chunk(buf, cs, ce, ctx, &mut masks, &mut dc, &mut o.ev, &mut pool),
+                                _ => clicks_chunk(buf, cs, ce, ctx, &mut masks, &mut dc, &mut o.cl, &mut pool),
+                            }
+                        }
+                        let _ = s1v[tid].set(o);
+                    }
+                    if barrier.wait().is_leader() {
+                        eprintln!(
+                            "[{:.3}] stage1 done (link map ready at {} ms) mem {} MB",
+                            t0.elapsed().as_secs_f64(),
+                            link_ready_ms.load(Ordering::Relaxed),
+                            mem_mb()
+                        );
+                    }
+                    let s1: Vec<&S1Out> = s1v.iter().map(|x| x.get().unwrap()).collect();
+                    let link_parts = link_parts.get().unwrap();
+
+                    // ---------------- stage 2: dedup, scatter by user_id ----------------
+                    {
+                        let mut o = S2Out { uv: Scatter::new(NP3) };
+                        let mut slices: Vec<(*const ERec, usize)> = Vec::new();
+                        let mut table: Vec<u64> = Vec::new();
+                        loop {
+                            let p = next2.fetch_add(1, Ordering::Relaxed);
+                            if p >= NP1 {
+                                break;
+                            }
+                            slices.clear();
+                            for t in &s1 {
+                                t.ev.each(p, |sl| slices.push((sl.as_ptr(), sl.len())));
+                            }
+                            dedup_partition(&slices, &mut table, &mut o.uv, &mut pool);
+                            // only now: the records were read in place
+                            for t in &s1 {
+                                t.ev.recycle(p, &mut pool);
+                            }
+                        }
+                        let _ = s2v[tid].set(o);
+                    }
+                    if barrier.wait().is_leader() {
+                        eprintln!("[{:.3}] stage2 done mem {} MB", t0.elapsed().as_secs_f64(), mem_mb());
+                    }
+                    let s2: Vec<&S2Out> = s2v.iter().map(|x| x.get().unwrap()).collect();
+
+                    // ---------------- stage 2b: resolve persons per user_id partition ----------------
+                    {
+                        let mut o = S2bOut { pv: Scatter::new(NP2), cv: Scatter::new(NP2) };
+                        let mut lm = LocalMap::new();
+                        loop {
+                            let p = next2b.fetch_add(1, Ordering::Relaxed);
+                            if p >= NP3 {
+                                break;
+                            }
+                            let ent = &link_parts.ent[link_parts.off[p] as usize..link_parts.off[p + 1] as usize];
+                            lm.load(ent);
+                            for t in &s2 {
+                                t.uv.each(p, |sl| {
+                                    for r in sl {
+                                        let person = lm.get(r.uid);
+                                        o.pv.push(part2(person), PRec { person, tm: r.tm }, &mut pool);
+                                    }
+                                });
+                                t.uv.recycle(p, &mut pool);
+                            }
+                            for t in &s1 {
+                                t.cl.each(p, |sl| {
+                                    for r in sl {
+                                        let person = lm.get(r.uid);
+                                        o.cv.push(part2(person), CRec { person, ckey: r.ckey, ts: r.ts, camp: r.camp }, &mut pool);
+                                    }
+                                });
+                                t.cl.recycle(p, &mut pool);
+                            }
+                        }
+                        let _ = s2bv[tid].set(o);
+                    }
+                    if barrier.wait().is_leader() {
+                        eprintln!("[{:.3}] stage2b done mem {} MB", t0.elapsed().as_secs_f64(), mem_mb());
+                    }
+                    let s2b: Vec<&S2bOut> = s2bv.iter().map(|x| x.get().unwrap()).collect();
+
+                    // ---------------- stage 3: sessions ----------------
+                    let (mut max_ev, mut max_cl) = (0usize, 0usize);
+                    for p in 0..NP2 {
+                        max_ev = max_ev.max(s2b.iter().map(|o| o.pv.part_len(p)).sum());
+                        max_cl = max_cl.max(s2b.iter().map(|o| o.cv.part_len(p)).sum());
+                    }
+                    let mut st = Stage3::new(ncamp, nd, cat_names, day0, ctx.base, max_ev, max_cl, pool);
                     loop {
-                        let p = next.fetch_add(1, Ordering::Relaxed);
+                        let p = next3.fetch_add(1, Ordering::Relaxed);
                         if p >= NP2 {
                             break;
                         }
-                        st.partition(p, s2b, cat_rank_ref);
+                        st.partition(p, &s2b, cat_rank);
+                        for o in &s2b {
+                            o.pv.recycle(p, &mut st.pool);
+                            o.cv.recycle(p, &mut st.pool);
+                        }
                     }
                     let tw = Instant::now();
                     let compute = tw.duration_since(t0).as_secs_f64();
-                    if !st.rows.is_empty() {
-                        out::write_users(&ud.join(format!("part-{tid:03}.parquet")), &st.rows, cat_names_ref);
-                    }
-                    eprintln!("  t{tid} stage3 compute end {compute:.3} write {:.3}s rows {}", tw.elapsed().as_secs_f64(), st.rows.len());
-                    if !st.rows.is_empty() {
+                    if st.cols.n > 0 {
+                        out::write_users(&ud.join(format!("part-{tid:03}.parquet")), &st.cols);
                         wrote_any.fetch_add(1, Ordering::Relaxed);
                     }
+                    eprintln!("  t{tid} stage3 compute end {compute:.3} write {:.3}s rows {}", tw.elapsed().as_secs_f64(), st.cols.n);
                     st.camp
                 })
             })
@@ -845,9 +861,9 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     if wrote_any.load(Ordering::Relaxed) == 0 {
-        out::write_users(&ud.join("part-empty.parquet"), &[], &cat_names);
+        out::write_users(&ud.join("part-empty.parquet"), &out::UCols::new());
     }
-    eprintln!("[{:.3}] stage3 done", t0.elapsed().as_secs_f64());
+    eprintln!("[{:.3}] stage3 done mem {} MB", t0.elapsed().as_secs_f64(), mem_mb());
 
     let mut total = vec![[0i64; 4]; ncs * nd];
     for s in &stats {
@@ -945,7 +961,7 @@ fn links_chunk(buf: &[u8], start: usize, end: usize, m: &mut Masks) -> Vec<(u64,
 }
 
 #[inline(never)]
-fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, out: &mut Scatter<ERec>, pool: &mut Pool) {
+fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, dc: &mut DayCache, out: &mut Scatter<ERec>, pool: &mut Pool) {
     let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -955,11 +971,11 @@ fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
             return;
         }
         let ekey = pack_noreg(buf, f[0].0, f[0].1);
-        let ingest = f1_field(buf, f[3].0, f[3].1).unwrap_or(i64::MAX / 4);
+        let ingest = f1_field(buf, f[3].0, f[3].1, dc).unwrap_or(i64::MAX / 4);
         let ingest_s = (ingest.max(0) / 1000).min(u32::MAX as i64) as u32;
         let has_uid = f[1].1 != f[1].0;
         let ukey = if has_uid { pack_reg(buf, f[1].0, f[1].1) } else { 0 };
-        let (ts, ts_ok) = match ts_at(buf, f[2].0, f[2].1) {
+        let (ts, ts_ok) = match ts_at(buf, f[2].0, f[2].1, dc) {
             Some(t) => (t, (t >= ws) & (t < we)),
             None => (0, false),
         };
@@ -989,14 +1005,14 @@ fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
 }
 
 #[inline(never)]
-fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, out: &mut Scatter<C1>, pool: &mut Pool) {
+fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, dc: &mut DayCache, out: &mut Scatter<C1>, pool: &mut Pool) {
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
     for_lines::<4>(buf, start, end, m, |f| {
         if f[0].1 == f[0].0 || f[1].1 == f[1].0 {
             return;
         }
-        let ts = match ts_at(buf, f[3].0, f[3].1) {
+        let ts = match ts_at(buf, f[3].0, f[3].1, dc) {
             Some(t) if t >= lo && t < hi => t,
             _ => return,
         };
@@ -1008,18 +1024,25 @@ fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
 }
 
 #[inline(never)]
-fn dedup_partition(local: &[ERec], table: &mut Vec<u64>, out: &mut Scatter<URec>, pool: &mut Pool) {
-    let n = local.len();
+fn dedup_partition(slices: &[(*const ERec, usize)], table: &mut Vec<u64>, out: &mut Scatter<URec>, pool: &mut Pool) {
+    // record index = slice << 9 | offset (a block holds < 512 records)
+    const _: () = assert!(Scatter::<ERec>::CAP < 512);
+    let n: usize = slices.iter().map(|s| s.1).sum();
     if n == 0 {
         return;
     }
+    assert!(slices.len() < 1 << 22, "too many blocks in one partition");
+    let at = |i: usize| -> ERec { unsafe { *slices.get_unchecked(i >> 9).0.add(i & 511) } };
     // slot = tag (high 32 bits of a hash of eid) << 32 | index + 1; 0 = empty
     let cap = (2 * n).next_power_of_two().max(16);
     let bits = cap.trailing_zeros();
     let mask = cap - 1;
     table.clear();
     table.resize(cap, 0);
-    for (i, r) in local.iter().enumerate() {
+    for (si, &(ptr, len)) in slices.iter().enumerate() {
+      for j in 0..len {
+        let r = unsafe { *ptr.add(j) };
+        let i = si << 9 | j;
         let eid = r.eid;
         let hv = eid.wrapping_mul(0xA076_1D64_78BD_642F);
         let tag = (hv.rotate_left(29) >> 32) << 32;
@@ -1031,8 +1054,7 @@ fn dedup_partition(local: &[ERec], table: &mut Vec<u64>, out: &mut Scatter<URec>
                 break;
             }
             if slot & !0xFFFF_FFFF == tag {
-                let j = (slot as u32 - 1) as usize;
-                let o = unsafe { local.get_unchecked(j) };
+                let o = at((slot as u32 - 1) as usize);
                 if o.eid == eid {
                     if r.ingest < o.ingest {
                         unsafe { *table.get_unchecked_mut(h) = tag | (i as u64 + 1) };
@@ -1042,28 +1064,19 @@ fn dedup_partition(local: &[ERec], table: &mut Vec<u64>, out: &mut Scatter<URec>
             }
             h = (h + 1) & mask;
         }
+      }
     }
     for &slot in table.iter() {
         if slot == 0 {
             continue;
         }
-        let r = unsafe { *local.get_unchecked((slot as u32 - 1) as usize) };
+        let r = at((slot as u32 - 1) as usize);
         if r.ts == u32::MAX {
             continue;
         }
         let uid = r.uid;
         out.push(part3(uid), URec { uid, tm: (r.ts as u64) << 32 | r.meta as u64 }, pool);
     }
-}
-
-#[derive(Clone, Copy)]
-pub struct URow {
-    pub person: u64,
-    pub day: i32,
-    pub sessions: u32,
-    pub events: u32,
-    pub revenue: i64,
-    pub top: u16, // u16::MAX = null
 }
 
 #[derive(Clone, Copy)]
@@ -1079,7 +1092,9 @@ struct Stage3 {
     day0: i64,
     base: i64,
     camp: Vec<[i64; 4]>,
-    rows: Vec<URow>,
+    cols: out::UCols,
+    pool: Pool,
+    cat_names: Vec<Vec<u8>>,
     // scratch
     persons: Vec<u64>,
     table: Vec<u32>,
@@ -1087,6 +1102,8 @@ struct Stage3 {
     cidx: Vec<u32>,
     ecount: Vec<u32>,
     ccount: Vec<u32>,
+    estart: Vec<u32>,
+    cstart: Vec<u32>,
     evs: Vec<u64>,
     cls: Vec<LClick>,
     cnt: Vec<u32>,
@@ -1097,22 +1114,29 @@ struct Stage3 {
 }
 
 impl Stage3 {
-    fn new(ncamp: usize, nd: usize, ncat: usize, day0: i64, base: i64) -> Self {
+    /// `max_ev` / `max_cl`: largest partition sizes. Output columns live in `pool` blocks.
+    fn new(ncamp: usize, nd: usize, cat_names: &[Vec<u8>], day0: i64, base: i64, max_ev: usize, max_cl: usize, pool: Pool) -> Self {
+        let ncat = cat_names.len();
+        let tcap = (2 * max_ev).next_power_of_two().max(256);
         Stage3 {
             ncamp,
             nd,
             day0,
             base,
             camp: vec![[0; 4]; (ncamp + 1) * nd],
-            rows: Vec::new(),
-            persons: Vec::new(),
-            table: Vec::new(),
-            eidx: Vec::new(),
-            cidx: Vec::new(),
-            ecount: Vec::new(),
-            ccount: Vec::new(),
-            evs: Vec::new(),
-            cls: Vec::new(),
+            cols: out::UCols::new(),
+            pool,
+            cat_names: cat_names.to_vec(),
+            persons: Vec::with_capacity(max_ev + 1),
+            table: Vec::with_capacity(tcap),
+            eidx: Vec::with_capacity(max_ev),
+            cidx: Vec::with_capacity(max_cl),
+            ecount: Vec::with_capacity(max_ev + 1),
+            ccount: Vec::with_capacity(max_ev + 2),
+            estart: Vec::with_capacity(max_ev + 1),
+            cstart: Vec::with_capacity(max_ev + 2),
+            evs: Vec::with_capacity(max_ev),
+            cls: Vec::with_capacity(max_cl),
             cnt: vec![0; ncamp + 1],
             pos: vec![0; ncamp + 1],
             active: Vec::new(),
@@ -1122,7 +1146,7 @@ impl Stage3 {
     }
 
 #[inline(never)]
-    fn partition(&mut self, p: usize, s2b: &[S2bOut], cat_rank: &[u16]) {
+    fn partition(&mut self, p: usize, s2b: &[&S2bOut], cat_rank: &[u16]) {
         let n_ev: usize = s2b.iter().map(|o| o.pv.part_len(p)).sum();
         if n_ev == 0 {
             return;
@@ -1180,7 +1204,8 @@ impl Stage3 {
             *c = acc;
             acc += v;
         }
-        let estart: Vec<u32> = self.ecount.clone();
+        self.estart.clear();
+        self.estart.extend_from_slice(&self.ecount);
         self.evs.clear();
         self.evs.resize(n_ev, 0);
         {
@@ -1226,7 +1251,8 @@ impl Stage3 {
             *c = acc;
             acc += v;
         }
-        let cstart: Vec<u32> = self.ccount.clone();
+        self.cstart.clear();
+        self.cstart.extend_from_slice(&self.ccount);
         self.cls.clear();
         self.cls.resize(n_cl, LClick { ts: 0, camp: 0, ckey: 0 });
         {
@@ -1245,10 +1271,10 @@ impl Stage3 {
             }
         }
         for pi in 0..np {
-            let es = estart[pi] as usize;
-            let ee = if pi + 1 < np { estart[pi + 1] as usize } else { n_ev };
-            let cs = cstart[pi] as usize;
-            let ce = cstart[pi + 1] as usize;
+            let es = self.estart[pi] as usize;
+            let ee = if pi + 1 < np { self.estart[pi + 1] as usize } else { n_ev };
+            let cs = self.cstart[pi] as usize;
+            let ce = self.cstart[pi + 1] as usize;
             let person = self.persons[pi];
             self.person(person, es, ee, cs, ce, cat_rank);
         }
@@ -1389,6 +1415,7 @@ impl Stage3 {
             self.catrev[c as usize] = 0;
         }
         self.touched.clear();
-        self.rows.push(URow { person, day: day as i32, sessions, events, revenue, top });
+        let t = if top == u16::MAX { None } else { Some(&self.cat_names[top as usize][..]) };
+        self.cols.push(&mut self.pool, person, day as i32, sessions, events, revenue, t);
     }
 }

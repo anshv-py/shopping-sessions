@@ -51,8 +51,11 @@ fn init() -> bool {
             BASE.store(1, Ordering::Release);
             return false;
         }
-        unsafe {
-            libc::madvise(p, REGION, libc::MADV_HUGEPAGE);
+        // getenv does not allocate (std::env would re-enter this allocator).
+        if unsafe { libc::getenv(c"NOHUGE".as_ptr()) }.is_null() {
+            unsafe {
+                libc::madvise(p, REGION, libc::MADV_HUGEPAGE);
+            }
         }
         let start = (p as usize + (2 << 20) - 1) & !((2 << 20) - 1);
         NEXT.store(start, Ordering::Relaxed);
@@ -170,4 +173,10 @@ unsafe impl GlobalAlloc for Bump {
         }
         q
     }
+}
+
+/// Bytes handed out from the region so far (slabs count in full).
+pub fn used() -> usize {
+    let b = BASE.load(Ordering::Relaxed);
+    if b > 2 { NEXT.load(Ordering::Relaxed) - b } else { 0 }
 }
