@@ -575,7 +575,7 @@ fn main() {
     };
 
     // Files and chunks.
-    let use_read = knob("READ").unwrap_or(0) == 1;
+    let use_read = knob("READ").unwrap_or(1) == 1;
     let mut maps: [Vec<memmap2::Mmap>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut files: [Vec<std::fs::File>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for (k, d) in ["links", "events", "clicks"].iter().enumerate() {
@@ -854,7 +854,7 @@ fn main() {
                         wrote_any.fetch_add(1, Ordering::Relaxed);
                     }
                     eprintln!("  t{tid} stage3 compute end {compute:.3} write {:.3}s rows {}", tw.elapsed().as_secs_f64(), st.cols.n);
-                    st.camp
+                    st.campaign_totals()
                 })
             })
             .collect();
@@ -1125,7 +1125,9 @@ struct Stage3 {
     nd: usize,
     day0: i64,
     base: i64,
-    camp: Vec<[i64; 4]>,
+    // campaign stats, day-major so one day's rows stay in cache: [day * (ncamp + 1) + camp]
+    cstat: Vec<[i64; 3]>, // sessions, purchasing sessions, revenue
+    assist: Vec<u32>,     // assisted sessions
     cols: out::UCols,
     pool: Pool,
     cat_names: Vec<Vec<u8>>,
@@ -1157,7 +1159,8 @@ impl Stage3 {
             nd,
             day0,
             base,
-            camp: vec![[0; 4]; (ncamp + 1) * nd],
+            cstat: vec![[0; 3]; (ncamp + 1) * nd],
+            assist: vec![0; (ncamp + 1) * nd],
             cols: out::UCols::new(),
             pool,
             cat_names: cat_names.to_vec(),
@@ -1329,7 +1332,6 @@ impl Stage3 {
             }
         }
         let organic = self.ncamp as u32;
-        let nd = self.nd;
         let n = ev.len();
         let (mut lo, mut hi) = (0usize, 0usize);
         let mut i = 0usize;
@@ -1399,13 +1401,13 @@ impl Stage3 {
             };
             let di = (day - self.day0) as usize;
             {
-                let e = &mut self.camp[credited as usize * nd + di];
+                let e = &mut self.cstat[di * (self.ncamp + 1) + credited as usize];
                 e[0] += 1;
                 e[1] += purch as i64;
                 e[2] += rev;
             }
             for &a in &self.active {
-                self.camp[a as usize * nd + di][3] += 1;
+                unsafe { *self.assist.get_unchecked_mut(di * (self.ncamp + 1) + a as usize) += 1 };
             }
             d_sess += 1;
             d_ev += nev;
@@ -1421,6 +1423,19 @@ impl Stage3 {
         }
         self.evs = evs;
         self.cls = cls;
+    }
+
+    /// Stats as [camp * nd + day] -> [sessions, purchasing, revenue, assisted].
+    fn campaign_totals(&self) -> Vec<[i64; 4]> {
+        let ncs = self.ncamp + 1;
+        let mut v = vec![[0i64; 4]; ncs * self.nd];
+        for d in 0..self.nd {
+            for c in 0..ncs {
+                let s = self.cstat[d * ncs + c];
+                v[c * self.nd + d] = [s[0], s[1], s[2], self.assist[d * ncs + c] as i64];
+            }
+        }
+        v
     }
 
     #[inline(always)]

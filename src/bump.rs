@@ -16,6 +16,7 @@ const BIG: usize = 1 << 20;
 static BASE: AtomicUsize = AtomicUsize::new(0); // 0 = uninitialised, 1 = failed
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 static END: AtomicUsize = AtomicUsize::new(0);
+static POPULATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 thread_local! {
     static CUR: Cell<usize> = const { Cell::new(0) };
@@ -52,6 +53,9 @@ fn init() -> bool {
             return false;
         }
         // getenv does not allocate (std::env would re-enter this allocator).
+        if !unsafe { libc::getenv(c"NOPOP".as_ptr()) }.is_null() {
+            POPULATE.store(false, Ordering::Relaxed);
+        }
         if unsafe { libc::getenv(c"NOHUGE".as_ptr()) }.is_null() {
             unsafe {
                 libc::madvise(p, REGION, libc::MADV_HUGEPAGE);
@@ -99,6 +103,11 @@ fn local(size: usize, align: usize) -> *mut u8 {
     let slab = global(SLAB, 2 << 20);
     if slab.is_null() {
         return slab;
+    }
+    // Fault the whole slab in with one call instead of one trap per page (slabs fill up;
+    // MADV_POPULATE_WRITE = 23, Linux 5.14+; ignored where unsupported).
+    if POPULATE.load(Ordering::Relaxed) {
+        unsafe { libc::madvise(slab as *mut libc::c_void, SLAB, 23) };
     }
     let s = slab as usize;
     let start = (s + align - 1) & !(align - 1);
