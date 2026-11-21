@@ -5,5 +5,5 @@ target/
 *.md
 .git
 scripts/
-tools/
+tools/generator/target/
 fuzzfail-*/
