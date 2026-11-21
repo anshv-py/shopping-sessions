@@ -2,3 +2,4 @@ target/
 out/
 dev/
 *.parquet
+fuzzfail-*/

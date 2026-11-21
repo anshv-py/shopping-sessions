@@ -91,70 +91,56 @@ pub fn parse_line<const N: usize>(buf: &[u8], mut i: usize, f: &mut [(usize, usi
 
 // ---------------------------------------------------------------- SIMD line walker
 
-/// Per-thread scratch: separator (',' or '\n') and quote bitmasks of one chunk.
+/// Per-thread scratch for `for_lines`: comma, newline and quote bitmasks of one chunk.
 #[derive(Default)]
 pub struct Masks {
-    sep: Vec<u64>,
     quo: Vec<u64>,
+    com: Vec<u64>,
+    nl: Vec<u64>,
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-fn block(p: &[u8; 64]) -> (u64, u64) {
+fn block3(p: &[u8; 64]) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
     unsafe {
         let a = _mm256_loadu_si256(p.as_ptr() as *const __m256i);
         let b = _mm256_loadu_si256(p.as_ptr().add(32) as *const __m256i);
-        let comma = _mm256_set1_epi8(b',' as i8);
-        let nl = _mm256_set1_epi8(b'\n' as i8);
-        let q = _mm256_set1_epi8(b'"' as i8);
-        let sa = _mm256_or_si256(_mm256_cmpeq_epi8(a, comma), _mm256_cmpeq_epi8(a, nl));
-        let sb = _mm256_or_si256(_mm256_cmpeq_epi8(b, comma), _mm256_cmpeq_epi8(b, nl));
-        let qa = _mm256_cmpeq_epi8(a, q);
-        let qb = _mm256_cmpeq_epi8(b, q);
-        let sep = (_mm256_movemask_epi8(sa) as u32 as u64) | ((_mm256_movemask_epi8(sb) as u32 as u64) << 32);
-        let quo = (_mm256_movemask_epi8(qa) as u32 as u64) | ((_mm256_movemask_epi8(qb) as u32 as u64) << 32);
-        (sep, quo)
+        let m = |v: __m256i, c: u8| _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32 as u64;
+        (
+            m(a, b',') | (m(b, b',') << 32),
+            m(a, b'\n') | (m(b, b'\n') << 32),
+            m(a, b'"') | (m(b, b'"') << 32),
+        )
     }
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-fn block(p: &[u8; 64]) -> (u64, u64) {
-    let mut sep = 0u64;
-    let mut quo = 0u64;
+fn block3(p: &[u8; 64]) -> (u64, u64, u64) {
+    let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
     for (i, &b) in p.iter().enumerate() {
-        sep |= ((b == b',' || b == b'\n') as u64) << i;
-        quo |= ((b == b'"') as u64) << i;
+        c |= ((b == b',') as u64) << i;
+        n |= ((b == b'\n') as u64) << i;
+        q |= ((b == b'"') as u64) << i;
     }
-    (sep, quo)
+    (c, n, q)
 }
 
+/// 128 bits of `v` starting at bit `a` (v must have 3 readable words past a >> 6).
 #[inline(always)]
-fn low_mask(k: usize) -> u64 {
-    if k >= 64 {
-        !0
+fn window(v: &[u64], a: usize) -> u128 {
+    let w = a >> 6;
+    let r = (a & 63) as u32;
+    let x0 = unsafe { *v.get_unchecked(w) } as u128;
+    let x1 = unsafe { *v.get_unchecked(w + 1) } as u128;
+    let x2 = unsafe { *v.get_unchecked(w + 2) } as u128;
+    let lo = x0 | (x1 << 64);
+    if r == 0 {
+        lo
     } else {
-        (1u64 << k) - 1
+        (lo >> r) | (x2 << (128 - r))
     }
-}
-
-/// Number of set bits of `v` in bit range [a, b).
-#[inline(always)]
-fn pop_range(v: &[u64], a: usize, b: usize) -> u32 {
-    if a >= b {
-        return 0;
-    }
-    let wa = a >> 6;
-    let wb = (b - 1) >> 6;
-    if wa == wb {
-        return ((v[wa] >> (a & 63)) & low_mask(b - a)).count_ones();
-    }
-    let mut c = (v[wa] >> (a & 63)).count_ones();
-    for w in wa + 1..wb {
-        c += v[w].count_ones();
-    }
-    c + (v[wb] & low_mask(((b - 1) & 63) + 1)).count_ones()
 }
 
 /// Calls `cb` with the N fields (quotes stripped) of every well-formed line that starts
@@ -174,78 +160,86 @@ pub fn for_lines<const N: usize>(
     }
     let e1 = if end >= len { len } else { skip_line(buf, end - 1) };
     let n = e1 - b0;
-    let words = n / 64 + 2;
-    m.sep.clear();
-    m.sep.resize(words, 0);
+    let words = n / 64 + 4;
+    m.com.clear();
+    m.com.resize(words, 0);
+    m.nl.clear();
+    m.nl.resize(words, 0);
     m.quo.clear();
     m.quo.resize(words, 0);
     let region = &buf[b0..e1];
     let full = n / 64;
     for w in 0..full {
         let blk: &[u8; 64] = region[w * 64..w * 64 + 64].try_into().unwrap();
-        let (s, q) = block(blk);
-        m.sep[w] = s;
+        let (c, l, q) = block3(blk);
+        m.com[w] = c;
+        m.nl[w] = l;
         m.quo[w] = q;
     }
     if n % 64 != 0 {
         let mut tmp = [0u8; 64];
         tmp[..n % 64].copy_from_slice(&region[full * 64..]);
-        let (s, q) = block(&tmp);
-        m.sep[full] = s;
+        let (c, l, q) = block3(&tmp);
+        m.com[full] = c;
+        m.nl[full] = l;
         m.quo[full] = q;
     }
     if region[n - 1] != b'\n' {
-        // Last line of the file without a trailing newline: a virtual one at n.
-        m.sep[n >> 6] |= 1u64 << (n & 63);
+        m.nl[n >> 6] |= 1u64 << (n & 63);
     }
-    let sep = &m.sep;
+    let com = &m.com;
+    let nl = &m.nl;
     let quo = &m.quo;
     let mut w = 0usize;
-    let mut bits = sep[0];
+    let mut nbits = nl[0];
     let mut ls = 0usize;
     let mut f = [(0usize, 0usize); N];
     while ls < n {
-        let mut s = ls;
-        let mut k = 0usize;
-        loop {
-            while bits == 0 {
-                w += 1;
-                bits = unsafe { *sep.get_unchecked(w) };
-            }
-            let p = w * 64 + bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let is_nl = p >= n || unsafe { *region.get_unchecked(p) } == b'\n';
-            if k < N {
-                f[k] = (b0 + s, b0 + p);
-            }
-            k += 1;
-            if is_nl {
-                if k == N {
-                    let q = pop_range(quo, ls, p);
-                    if q == 0 {
+        while nbits == 0 {
+            w += 1;
+            nbits = unsafe { *nl.get_unchecked(w) };
+        }
+        let le = w * 64 + nbits.trailing_zeros() as usize;
+        nbits &= nbits - 1;
+        let l = le - ls;
+        if l < 128 {
+            let lm: u128 = (1u128 << l) - 1;
+            let mut cw = window(com, ls) & lm;
+            if cw.count_ones() as usize == N - 1 {
+                let mut prev = ls;
+                for fk in f.iter_mut().take(N - 1) {
+                    let p = ls + cw.trailing_zeros() as usize;
+                    cw &= cw - 1;
+                    *fk = (b0 + prev, b0 + p);
+                    prev = p + 1;
+                }
+                f[N - 1] = (b0 + prev, b0 + le);
+                let q = (window(quo, ls) & lm).count_ones();
+                if q == 0 {
+                    cb(&f);
+                } else {
+                    let mut shaped = 0u32;
+                    for fk in f.iter_mut() {
+                        let (a, b) = *fk;
+                        let sh = (b - a >= 2)
+                            && unsafe { *buf.get_unchecked(a) } == b'"'
+                            && unsafe { *buf.get_unchecked(b - 1) } == b'"';
+                        let d = sh as usize;
+                        *fk = (a + d, b - d);
+                        shaped += d as u32;
+                    }
+                    if q == 2 * shaped {
                         cb(&f);
-                    } else {
-                        let mut shaped = 0u32;
-                        for fk in f.iter_mut() {
-                            let (a, b) = *fk;
-                            // a < b <= len whenever b - a >= 2, so both reads are in bounds
-                            let sh = (b - a >= 2)
-                                && unsafe { *buf.get_unchecked(a) } == b'"'
-                                && unsafe { *buf.get_unchecked(b - 1) } == b'"';
-                            let d = sh as usize;
-                            *fk = (a + d, b - d);
-                            shaped += d as u32;
-                        }
-                        if q == 2 * shaped {
-                            cb(&f);
-                        }
                     }
                 }
-                ls = p + 1;
-                break;
             }
-            s = p + 1;
+        } else {
+            let (_, ok) = parse_line::<N>(&buf[..b0 + le], b0 + ls, &mut f);
+            if ok {
+                cb(&f);
+            }
         }
+        ls = le + 1;
     }
 }
 
@@ -488,14 +482,6 @@ fn parse_dt(s: &[u8]) -> Option<i64> {
     Some((days * 86_400 + h * 3600 + mi * 60 + se) * 1000)
 }
 
-#[inline(always)]
-pub fn parse_f1(s: &[u8]) -> Option<i64> {
-    if s.len() == 20 && s[19] == b'Z' {
-        parse_dt(s)
-    } else {
-        None
-    }
-}
 
 #[inline(always)]
 pub fn parse_ts(s: &[u8]) -> Option<i64> {
