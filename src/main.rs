@@ -769,7 +769,7 @@ fn main() {
                     {
                         let mut o = S2Out { uv: Scatter::new(NP3) };
                         let mut slices: Vec<(*const ERec, usize)> = Vec::new();
-                        let mut table: Vec<u64> = Vec::new();
+                        let mut dd = Dedup::new();
                         loop {
                             let p = next2.fetch_add(1, Ordering::Relaxed);
                             if p >= NP1 {
@@ -779,7 +779,7 @@ fn main() {
                             for t in &s1 {
                                 t.ev.each(p, |sl| slices.push((sl.as_ptr(), sl.len())));
                             }
-                            dedup_partition(&slices, &mut table, &mut o.uv, &mut pool);
+                            dedup_partition(&slices, &mut dd, &mut o.uv, &mut pool);
                             // only now: the records were read in place
                             for t in &s1 {
                                 t.ev.recycle(p, &mut pool);
@@ -1023,8 +1023,22 @@ fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
     });
 }
 
+/// Per-thread dedup scratch. Table slots carry the partition's epoch, so the table is
+/// never cleared: a slot from an earlier partition reads as empty.
+struct Dedup {
+    table: Vec<u64>, // epoch << 48 | tag << 32 | index + 1
+    epoch: u64,
+    dead: Vec<u64>, // bit per record index: a copy that lost to another copy
+}
+
+impl Dedup {
+    fn new() -> Self {
+        Dedup { table: Vec::new(), epoch: 0, dead: Vec::new() }
+    }
+}
+
 #[inline(never)]
-fn dedup_partition(slices: &[(*const ERec, usize)], table: &mut Vec<u64>, out: &mut Scatter<URec>, pool: &mut Pool) {
+fn dedup_partition(slices: &[(*const ERec, usize)], d: &mut Dedup, out: &mut Scatter<URec>, pool: &mut Pool) {
     // record index = slice << 9 | offset (a block holds < 512 records)
     const _: () = assert!(Scatter::<ERec>::CAP < 512);
     let n: usize = slices.iter().map(|s| s.1).sum();
@@ -1033,49 +1047,69 @@ fn dedup_partition(slices: &[(*const ERec, usize)], table: &mut Vec<u64>, out: &
     }
     assert!(slices.len() < 1 << 22, "too many blocks in one partition");
     let at = |i: usize| -> ERec { unsafe { *slices.get_unchecked(i >> 9).0.add(i & 511) } };
-    // slot = tag (high 32 bits of a hash of eid) << 32 | index + 1; 0 = empty
     let cap = (2 * n).next_power_of_two().max(16);
     let bits = cap.trailing_zeros();
     let mask = cap - 1;
-    table.clear();
-    table.resize(cap, 0);
+    if d.table.len() < cap {
+        d.table.resize(cap, 0); // new slots have epoch 0: empty
+    }
+    d.epoch += 1;
+    if d.epoch == 1 << 16 {
+        d.table.iter_mut().for_each(|x| *x = 0);
+        d.epoch = 1;
+    }
+    let ep = d.epoch << 48;
+    d.dead.clear();
+    d.dead.resize(slices.len() * 8, 0);
+    let table = &mut d.table;
+    let dead = &mut d.dead;
     for (si, &(ptr, len)) in slices.iter().enumerate() {
-      for j in 0..len {
-        let r = unsafe { *ptr.add(j) };
-        let i = si << 9 | j;
-        let eid = r.eid;
-        let hv = eid.wrapping_mul(0xA076_1D64_78BD_642F);
-        let tag = (hv.rotate_left(29) >> 32) << 32;
-        let mut h = thash(eid, bits);
-        loop {
-            let slot = unsafe { *table.get_unchecked(h) };
-            if slot == 0 {
-                unsafe { *table.get_unchecked_mut(h) = tag | (i as u64 + 1) };
-                break;
-            }
-            if slot & !0xFFFF_FFFF == tag {
-                let o = at((slot as u32 - 1) as usize);
-                if o.eid == eid {
-                    if r.ingest < o.ingest {
-                        unsafe { *table.get_unchecked_mut(h) = tag | (i as u64 + 1) };
-                    }
+        for j in 0..len {
+            let r = unsafe { *ptr.add(j) };
+            let i = si << 9 | j;
+            let eid = r.eid;
+            let hv = eid.wrapping_mul(0xA076_1D64_78BD_642F);
+            let key = ep | (hv >> 48) << 32; // epoch and 16-bit tag
+            let mut h = thash(eid, bits);
+            loop {
+                let slot = unsafe { *table.get_unchecked(h) };
+                if slot >> 48 != d.epoch {
+                    unsafe { *table.get_unchecked_mut(h) = key | (i as u64 + 1) };
                     break;
                 }
+                if slot & !0xFFFF_FFFF == key {
+                    let oi = (slot as u32 - 1) as usize;
+                    let o = at(oi);
+                    if o.eid == eid {
+                        // keep the smallest ingest_ts (equal ones are identical copies)
+                        let lose = if r.ingest < o.ingest {
+                            unsafe { *table.get_unchecked_mut(h) = key | (i as u64 + 1) };
+                            oi
+                        } else {
+                            i
+                        };
+                        unsafe { *dead.get_unchecked_mut(lose >> 6) |= 1u64 << (lose & 63) };
+                        break;
+                    }
+                }
+                h = (h + 1) & mask;
             }
-            h = (h + 1) & mask;
         }
-      }
     }
-    for &slot in table.iter() {
-        if slot == 0 {
-            continue;
+    // survivors, read sequentially
+    for (si, &(ptr, len)) in slices.iter().enumerate() {
+        for j in 0..len {
+            let i = si << 9 | j;
+            if unsafe { *dead.get_unchecked(i >> 6) } >> (i & 63) & 1 != 0 {
+                continue;
+            }
+            let r = unsafe { *ptr.add(j) };
+            if r.ts == u32::MAX {
+                continue;
+            }
+            let uid = r.uid;
+            out.push(part3(uid), URec { uid, tm: (r.ts as u64) << 32 | r.meta as u64 }, pool);
         }
-        let r = at((slot as u32 - 1) as usize);
-        if r.ts == u32::MAX {
-            continue;
-        }
-        let uid = r.uid;
-        out.push(part3(uid), URec { uid, tm: (r.ts as u64) << 32 | r.meta as u64 }, pool);
     }
 }
 
