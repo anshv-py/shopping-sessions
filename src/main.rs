@@ -650,24 +650,24 @@ fn main() {
             for c in chunks.iter().filter(|c| c.kind == 1) {
                 let buf: &[u8] = &maps[1][c.file];
                 if mode == "split" {
-                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += f[6].1);
+                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += f.e(6));
                 } else if mode == "keys" {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
-                        acc += (pack_noreg(buf, f[0].0, f[0].1) ^ pack_reg(buf, f[1].0, f[1].1)) as usize
+                        acc += (pack_noreg(buf, f.s(0), f.e(0)) ^ pack_reg(buf, f.s(1), f.e(1))) as usize
                     });
                 } else if mode == "ts" {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
-                        acc += ts_at(buf, f[2].0, f[2].1, &mut dc).unwrap_or(1) as usize
-                            + f1_field(buf, f[3].0, f[3].1, &mut dc).unwrap_or(1) as usize
+                        acc += ts_at(buf, f.s(2), f.e(2), &mut dc).unwrap_or(1) as usize
+                            + f1_field(buf, f.s(3), f.e(3), &mut dc).unwrap_or(1) as usize
                     });
                 } else if mode == "ing" {
-                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += f1_field(buf, f[3].0, f[3].1, &mut dc).unwrap_or(1) as usize);
+                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += f1_field(buf, f.s(3), f.e(3), &mut dc).unwrap_or(1) as usize);
                 } else if mode == "tsonly" {
-                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += ts_at(buf, f[2].0, f[2].1, &mut dc).unwrap_or(1) as usize);
+                    for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += ts_at(buf, f.s(2), f.e(2), &mut dc).unwrap_or(1) as usize);
                 } else if mode == "push" {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
-                        let k = f[0].0 as u64 * 0x9E37_79B9_7F4A_7C15;
-                        sc.push(part1(k), ERec { eid: k, uid: f[1].0 as u64, ingest: 0, ts: 0, meta: 0 }, &mut pool)
+                        let k = f.s(0) as u64 * 0x9E37_79B9_7F4A_7C15;
+                        sc.push(part1(k), ERec { eid: k, uid: f.s(1) as u64, ingest: 0, ts: 0, meta: 0 }, &mut pool)
                     });
                 } else {
                     events_chunk(buf, c.start, c.end, &ctx, &mut bm, &mut dc, &mut sc, &mut pool);
@@ -983,8 +983,8 @@ fn load_chunk(f: &std::fs::File, flen: usize, start: usize, end: usize, buf: &mu
 fn links_chunk(buf: &[u8], start: usize, end: usize, m: &mut Masks) -> Vec<(u64, u64)> {
     let mut v = Vec::with_capacity((end - start) / 20 + 16);
     for_lines::<2>(buf, start, end, m, |f| {
-        if f[0].1 > f[0].0 && f[1].1 > f[1].0 {
-            v.push((pack_reg(buf, f[0].0, f[0].1), pack_reg(buf, f[1].0, f[1].1)));
+        if f.e(0) > f.s(0) && f.e(1) > f.s(1) {
+            v.push((pack_reg(buf, f.s(0), f.e(0)), pack_reg(buf, f.s(1), f.e(1))));
         }
     });
     v
@@ -997,29 +997,29 @@ fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     for_lines::<7>(buf, start, end, m, |f| {
-        if f[0].1 == f[0].0 {
+        if f.e(0) == f.s(0) {
             return;
         }
-        let ekey = pack_noreg(buf, f[0].0, f[0].1);
-        let ingest = f1_field(buf, f[3].0, f[3].1, dc).unwrap_or(i64::MAX / 4);
+        let ekey = pack_noreg(buf, f.s(0), f.e(0));
+        let ingest = f1_field(buf, f.s(3), f.e(3), dc).unwrap_or(i64::MAX / 4);
         let ingest_s = (ingest.max(0) / 1000).min(u32::MAX as i64) as u32;
-        let has_uid = f[1].1 != f[1].0;
-        let ukey = if has_uid { pack_reg(buf, f[1].0, f[1].1) } else { 0 };
-        let (ts, ts_ok) = match ts_at(buf, f[2].0, f[2].1, dc) {
+        let has_uid = f.e(1) != f.s(1);
+        let ukey = if has_uid { pack_reg(buf, f.s(1), f.e(1)) } else { 0 };
+        let (ts, ts_ok) = match ts_at(buf, f.s(2), f.e(2), dc) {
             Some(t) => (t, (t >= ws) & (t < we)),
             None => (0, false),
         };
         // event type as integers: view / cart (len 4) or purchase (len 8)
-        let tl = f[4].1 - f[4].0;
-        let w4 = if tl == 4 { rd32_at(buf, f[4].0) } else { 0 };
+        let tl = f.e(4) - f.s(4);
+        let w4 = if tl == 4 { rd32_at(buf, f.s(4)) } else { 0 };
         let vc = (w4 == VIEW) | (w4 == CART);
-        let pu = tl == 8 && rd64(buf, f[4].0) == PURCHASE;
-        let mut valid = has_uid & ts_ok & (vc | pu) & (f[5].1 != f[5].0) & (ingest - ts <= DAY);
+        let pu = tl == 8 && rd64(buf, f.s(4)) == PURCHASE;
+        let mut valid = has_uid & ts_ok & (vc | pu) & (f.e(5) != f.s(5)) & (ingest - ts <= DAY);
         let mut meta = 0u32;
         if pu & valid {
-            match parse_price(unsafe { buf.get_unchecked(f[6].0..f[6].1) }) {
+            match parse_price(unsafe { buf.get_unchecked(f.s(6)..f.e(6)) }) {
                 Some(p) => {
-                    let cat = match ctx.products.get_at(buf, f[5].0, f[5].1) {
+                    let cat = match ctx.products.get_at(buf, f.s(5), f.e(5)) {
                         Some(c) => c as u8,
                         None => ctx.unknown_cat,
                     };
@@ -1038,16 +1038,16 @@ fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
     for_lines::<4>(buf, start, end, m, |f| {
-        if f[0].1 == f[0].0 || f[1].1 == f[1].0 {
+        if f.e(0) == f.s(0) || f.e(1) == f.s(1) {
             return;
         }
-        let ts = match ts_at(buf, f[3].0, f[3].1, dc) {
+        let ts = match ts_at(buf, f.s(3), f.e(3), dc) {
             Some(t) if t >= lo && t < hi => t,
             _ => return,
         };
-        let Some(camp) = ctx.campaigns.get_at(buf, f[2].0, f[2].1) else { return };
-        let ckey = pack_reg(buf, f[0].0, f[0].1);
-        let uid = pack_reg(buf, f[1].0, f[1].1);
+        let Some(camp) = ctx.campaigns.get_at(buf, f.s(2), f.e(2)) else { return };
+        let ckey = pack_reg(buf, f.s(0), f.e(0));
+        let uid = pack_reg(buf, f.s(1), f.e(1));
         out.push(part3(uid), C1 { uid, ckey, ts: (ts - ctx.base) as u32, camp: camp as u32 }, pool);
     });
 }
@@ -1150,6 +1150,14 @@ fn dedup_partition(slices: &[(*const ERec, usize)], d: &mut Dedup, out: &mut Sca
     }
 }
 
+/// An event being sorted in stage 3: its ts << 32 | meta and its person's index.
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct SE {
+    tm: u64,
+    idx: u32,
+}
+
 #[derive(Clone, Copy)]
 struct LClick {
     ts: u32,
@@ -1171,7 +1179,9 @@ struct Stage3 {
     // scratch
     persons: Vec<u64>,
     table: Vec<u32>,
-    eidx: Vec<u32>,
+    ra: Vec<SE>,
+    rb: Vec<SE>,
+    hist: Vec<u32>,
     cidx: Vec<u32>,
     ecount: Vec<u32>,
     ccount: Vec<u32>,
@@ -1203,7 +1213,9 @@ impl Stage3 {
             cat_names: cat_names.to_vec(),
             persons: Vec::with_capacity(max_ev + 1),
             table: Vec::with_capacity(tcap),
-            eidx: Vec::with_capacity(max_ev),
+            ra: Vec::with_capacity(max_ev),
+            rb: Vec::with_capacity(max_ev),
+            hist: vec![0; 3 << 11],
             cidx: Vec::with_capacity(max_cl),
             ecount: Vec::with_capacity(max_ev + 1),
             ccount: Vec::with_capacity(max_ev + 2),
@@ -1232,7 +1244,7 @@ impl Stage3 {
         self.table.clear();
         self.table.resize(cap, u32::MAX);
         self.persons.clear();
-        self.eidx.clear();
+        self.ra.clear();
         self.ecount.clear();
         // group events by person
         for o in s2b {
@@ -1266,7 +1278,7 @@ impl Stage3 {
                     }
                     h = (h + 1) & mask;
                 };
-                self.eidx.push(idx);
+                self.ra.push(SE { tm: r.tm, idx });
                 unsafe { *self.ecount.get_unchecked_mut(idx as usize) += 1 };
             });
         }
@@ -1280,20 +1292,7 @@ impl Stage3 {
         }
         self.estart.clear();
         self.estart.extend_from_slice(&self.ecount);
-        self.evs.clear();
-        self.evs.resize(n_ev, 0);
-        {
-            let mut k = 0usize;
-            for o in s2b {
-                o.pv.each(p, |sl| for r in sl {
-                    let idx = self.eidx[k] as usize;
-                    k += 1;
-                    let at = self.ecount[idx] as usize;
-                    self.ecount[idx] += 1;
-                    unsafe { *self.evs.get_unchecked_mut(at) = r.tm };
-                });
-            }
-        }
+        self.sort_events(n_ev);
         // clicks
         self.ccount.clear();
         self.ccount.resize(np + 1, 0);
@@ -1354,12 +1353,69 @@ impl Stage3 {
         }
     }
 
+    /// LSD radix sort of `ra` by ts (11-bit digits, constant digits skipped), then a stable
+    /// scatter by person index into `evs`: every person's events end up in ts order.
+    /// (Order among equal ts does not matter: everything downstream sums.)
+    #[inline(never)]
+    fn sort_events(&mut self, n: usize) {
+        let hist = &mut self.hist[..];
+        hist.iter_mut().for_each(|x| *x = 0);
+        for e in self.ra.iter() {
+            let t = (e.tm >> 32) as u32;
+            unsafe {
+                *hist.get_unchecked_mut((t & 2047) as usize) += 1;
+                *hist.get_unchecked_mut(2048 + ((t >> 11) & 2047) as usize) += 1;
+                *hist.get_unchecked_mut(4096 + (t >> 22) as usize) += 1;
+            }
+        }
+        self.rb.clear();
+        self.rb.reserve(n);
+        unsafe { self.rb.set_len(n) };
+        let (mut src, mut dst) = (&mut self.ra, &mut self.rb);
+        for d in 0..3 {
+            let h = &mut hist[d << 11..(d + 1) << 11];
+            if h.iter().any(|&c| c as usize == n) {
+                continue; // one bucket holds everything: already ordered by this digit
+            }
+            let mut acc = 0u32;
+            for c in h.iter_mut() {
+                let v = *c;
+                *c = acc;
+                acc += v;
+            }
+            let sh = 11 * d as u32;
+            let (sp, dp) = (src.as_ptr(), dst.as_mut_ptr());
+            for k in 0..n {
+                unsafe {
+                    let e = *sp.add(k);
+                    let b = (((e.tm >> 32) as u32 >> sh) & 2047) as usize;
+                    let at = *h.get_unchecked(b) as usize;
+                    *h.get_unchecked_mut(b) = at as u32 + 1;
+                    *dp.add(at) = e;
+                }
+            }
+            std::mem::swap(&mut src, &mut dst);
+        }
+        self.evs.clear();
+        self.evs.reserve(n);
+        unsafe { self.evs.set_len(n) };
+        let (sp, ep, cnt) = (src.as_ptr(), self.evs.as_mut_ptr(), self.ecount.as_mut_ptr());
+        for k in 0..n {
+            unsafe {
+                let e = *sp.add(k);
+                let c = cnt.add(e.idx as usize);
+                let at = *c as usize;
+                *c = at as u32 + 1;
+                *ep.add(at) = e.tm;
+            }
+        }
+    }
+
 #[inline(never)]
     fn person(&mut self, person: u64, es: usize, ee: usize, cs: usize, ce: usize, cat_rank: &[u16]) {
         let mut evs = std::mem::take(&mut self.evs);
         let mut cls = std::mem::take(&mut self.cls);
-        let ev = &mut evs[es..ee];
-        ev.sort_unstable();
+        let ev = &mut evs[es..ee]; // in ts order (sort_events)
         let cl = &mut cls[cs..ce];
         if cl.len() > 1 {
             if cl.iter().any(|c| c.ckey & FB != 0) {

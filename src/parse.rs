@@ -222,14 +222,41 @@ fn next_set(v: &[u64], i: usize) -> usize {
 /// not a whole one-byte field (the preceding field closes with one). Quote rule: every
 /// field is free of quotes or is `"` + quote-free text + `"`, i.e. the line's quote count
 /// equals twice the number of fields that both open and close with a quote.
+/// The fields of one line: field k is buf[s(k)..e(k)] (quotes stripped).
+pub struct Fields {
+    b0: usize,
+    s: [u32; 8],
+    e: [u32; 8],
+}
+
+impl Fields {
+    #[inline(always)]
+    pub fn s(&self, k: usize) -> usize {
+        self.b0 + self.s[k] as usize
+    }
+    #[inline(always)]
+    pub fn e(&self, k: usize) -> usize {
+        self.b0 + self.e[k] as usize
+    }
+    #[inline(always)]
+    pub fn get(&self, k: usize) -> (usize, usize) {
+        (self.s(k), self.e(k))
+    }
+    #[inline(always)]
+    pub fn is_empty(&self, k: usize) -> bool {
+        self.s[k] == self.e[k]
+    }
+}
+
 #[inline(always)]
 pub fn for_lines<const N: usize>(
     buf: &[u8],
     start: usize,
     end: usize,
     m: &mut Masks,
-    mut cb: impl FnMut(&[(usize, usize); N]),
+    mut cb: impl FnMut(&Fields),
 ) {
+    const { assert!(N >= 1 && N <= 8) };
     let len = buf.len();
     let b0 = chunk_begin(buf, start);
     if b0 >= end || b0 >= len {
@@ -327,13 +354,20 @@ pub fn for_lines<const N: usize>(
         put_bits(qef, np, pext64(qb & !d2, d));
         np += cnt;
     }
-    unsafe { m.pos.set_len(np) };
+    // 8 initialised entries past the end: the field loads below read up to 8 ahead
+    unsafe {
+        for k in 0..8 {
+            *pos.add(np + k) = 0;
+        }
+        m.pos.set_len(np);
+    }
     let pos: &[u32] = &m.pos;
+    let posp = pos.as_ptr();
     let (nlf, qsf, qef): (&[u64], &[u64], &[u64]) = (&m.nlf, &m.qsf, &m.qef);
     let quo: &[u64] = &m.quo;
     let want = 1u64 << (N - 1);
     let fmask = (1u64 << N) - 1;
-    let mut f = [(0usize, 0usize); N];
+    let mut f = Fields { b0, s: [0; 8], e: [0; 8] };
     let mut i = 1usize;
     let mut ls = 0usize;
     while i < np {
@@ -342,11 +376,22 @@ pub fn for_lines<const N: usize>(
             // N-1 commas, then the newline; field k spans delimiters i-1+k .. i+k
             let le = unsafe { *pos.get_unchecked(i + N - 1) } as usize;
             let pm = bits64(qsf, i - 1) & bits64(qef, i) & fmask; // quoted fields
-            for (k, fk) in f.iter_mut().enumerate() {
-                let s = unsafe { *pos.get_unchecked(i - 1 + k) }.wrapping_add(1) as usize;
-                let e = unsafe { *pos.get_unchecked(i + k) } as usize;
-                let d = ((pm >> k) & 1) as usize;
-                *fk = (b0 + s + d, b0 + e - d);
+            // field k: start = pos[i-1+k] + 1 + d, end = pos[i+k] - d (d = 1 if quoted)
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            unsafe {
+                use std::arch::x86_64::*;
+                let p0 = _mm256_loadu_si256(posp.add(i - 1) as *const __m256i);
+                let p1 = _mm256_loadu_si256(posp.add(i) as *const __m256i);
+                let one = _mm256_set1_epi32(1);
+                let d = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(pm as i32), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7)), one);
+                _mm256_storeu_si256(f.s.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(_mm256_add_epi32(p0, one), d));
+                _mm256_storeu_si256(f.e.as_mut_ptr() as *mut __m256i, _mm256_sub_epi32(p1, d));
+            }
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+            for k in 0..N {
+                let d = ((pm >> k) & 1) as u32;
+                f.s[k] = unsafe { *posp.add(i - 1 + k) }.wrapping_add(1) + d;
+                f.e[k] = unsafe { *posp.add(i + k) } - d;
             }
             let l = le - ls;
             let quotes = if l < 128 {
@@ -1025,6 +1070,12 @@ mod tests {
             let fast = ts_at(&buf, 0, s.len(), &mut dc);
             let slow = parse_ts(&s);
             assert_eq!(fast, slow, "{:?}", String::from_utf8_lossy(&s));
+            // and with plenty of readable bytes after the field
+            let mut long = s.clone();
+            for _ in 0..40 {
+                long.push(b"0123456789Z:-+T,\n"[r.below(17) as usize]);
+            }
+            assert_eq!(ts_at(&long, 0, s.len(), &mut dc), slow, "long {:?}", String::from_utf8_lossy(&s));
             if s.len() == 20 {
                 assert_eq!(f1_field(&buf, 0, 20, &mut dc), if s[19] == b'Z' { parse_ts(&s) } else { None });
             }
@@ -1088,7 +1139,7 @@ mod tests {
                 continue;
             }
             let mut got: Vec<Vec<(usize, usize)>> = Vec::new();
-            for_lines::<N>(&buf, s, e, m, |f| got.push(f.to_vec()));
+            for_lines::<N>(&buf, s, e, m, |f| got.push((0..N).map(|k| f.get(k)).collect()));
             let want = lines_ref::<N>(&buf, s, e);
             assert_eq!(got, want, "N={N} chunk {s}..{e} of {:?}", String::from_utf8_lossy(&buf));
         }
