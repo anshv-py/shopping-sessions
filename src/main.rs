@@ -850,7 +850,7 @@ fn main() {
                     let tw = Instant::now();
                     let compute = tw.duration_since(t0).as_secs_f64();
                     if st.cols.n > 0 {
-                        out::write_users(&ud.join(format!("part-{tid:03}.parquet")), &st.cols);
+                        out::write_users(&ud.join(format!("part-{tid:03}.parquet")), &st.cols, cat_names);
                         wrote_any.fetch_add(1, Ordering::Relaxed);
                     }
                     eprintln!("  t{tid} stage3 compute end {compute:.3} write {:.3}s rows {}", tw.elapsed().as_secs_f64(), st.cols.n);
@@ -861,7 +861,7 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     if wrote_any.load(Ordering::Relaxed) == 0 {
-        out::write_users(&ud.join("part-empty.parquet"), &out::UCols::new());
+        out::write_users(&ud.join("part-empty.parquet"), &out::UCols::new(), &cat_names);
     }
     eprintln!("[{:.3}] stage3 done mem {} MB", t0.elapsed().as_secs_f64(), mem_mb());
 
@@ -1449,7 +1449,7 @@ impl Stage3 {
             self.catrev[c as usize] = 0;
         }
         self.touched.clear();
-        let t = if top == u16::MAX { None } else { Some(&self.cat_names[top as usize][..]) };
+        let t = if top == u16::MAX { None } else { Some(top as u8) };
         self.cols.push(&mut self.pool, person, day as i32, sessions, events, revenue, t);
     }
 }

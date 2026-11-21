@@ -241,7 +241,7 @@ pub fn run(data: &Path, out: &Path) -> ! {
 
     std::fs::create_dir_all(out.join("user_daily")).ok();
     std::fs::create_dir_all(out.join("campaign_daily")).ok();
-    crate::out::write_users(&out.join("user_daily").join("part-0.parquet"), &crate::out::UCols::new());
+    crate::out::write_users(&out.join("user_daily").join("part-0.parquet"), &crate::out::UCols::new(), &[]);
     crate::out::write_campaigns(&out.join("campaign_daily").join("part-0.parquet"), &[], &[], &[]);
     std::process::exit(0);
 }
