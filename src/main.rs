@@ -55,7 +55,25 @@ struct ERec {
     uid: u64,
     ingest: u32, // seconds since epoch (saturated)
     ts: u32,     // relative to base; u32::MAX = invalid / late
-    meta: u32,   // price (24 bits) | category << 24, 0 for non-purchase
+}
+
+/// ERec.ts flag: a valid purchase, whose price and category are in a `PMeta` side record.
+/// Relative times stay below 2^31, so a flagged ts never equals u32::MAX (invalid).
+const PURCH: u32 = 1 << 31;
+
+/// Purchase records are sparse (~3% of events), so they use 64 coarse partitions, each
+/// covering 2^PM_SHIFT event partitions: fewer barely-filled blocks.
+const PM_SHIFT: u32 = 4;
+const NPM: usize = NP1 >> PM_SHIFT;
+
+/// Price and category of a valid purchase copy, partitioned by part1(eid) >> PM_SHIFT;
+/// (eid, ingest) identifies the copy (copies with equal ingest are identical).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PMeta {
+    eid: u64,
+    ingest: u32,
+    meta: u32, // price (24 bits) | category << 24
 }
 
 /// Deduplicated surviving event, partitioned by user_id.
@@ -476,6 +494,7 @@ struct Chunk {
 
 struct S1Out {
     ev: Scatter<ERec>,
+    pm: Scatter<PMeta>, // purchase details of `ev`
     cl: Scatter<C1>,
 }
 
@@ -651,10 +670,11 @@ fn main() {
         let mut pool = Pool::new();
         let mut bm = Masks::default();
         let mut dc = DayCache::default();
-        let mut breg = Reg::default();
+        let mut bq = UidQueue::new(0);
         let mut best = f64::MAX;
         for _ in 0..reps {
             let mut sc: Scatter<ERec> = Scatter::new(NP1);
+            let mut spm: Scatter<PMeta> = Scatter::new(NPM);
             let t = Instant::now();
             let mut acc = 0usize;
             for c in chunks.iter().filter(|c| c.kind == 1) {
@@ -663,7 +683,7 @@ fn main() {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += f.e(6));
                 } else if mode == "keys" {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
-                        acc += (pack_noreg(buf, f.s(0), f.e(0)) ^ pack_reg(buf, f.s(1), f.e(1), &mut breg)) as usize
+                        acc += (pack_noreg(buf, f.s(0), f.e(0)) ^ pack_uid(buf, f.s(1), f.e(1), &mut bq)) as usize
                     });
                 } else if mode == "ts" {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
@@ -677,10 +697,10 @@ fn main() {
                 } else if mode == "push" {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
                         let k = f.s(0) as u64 * 0x9E37_79B9_7F4A_7C15;
-                        sc.push(part1(k), ERec { eid: k, uid: f.s(1) as u64, ingest: 0, ts: 0, meta: 0 }, &mut pool)
+                        sc.push(part1(k), ERec { eid: k, uid: f.s(1) as u64, ingest: 0, ts: 0 }, &mut pool)
                     });
                 } else {
-                    events_chunk(buf, c.start, c.end, &ctx, &mut bm, &mut dc, &mut breg, &mut sc, &mut pool);
+                    events_chunk(buf, c.start, c.end, &ctx, &mut bm, &mut dc, &mut bq, &mut sc, &mut spm, &mut pool);
                 }
             }
             best = best.min(t.elapsed().as_secs_f64());
@@ -721,6 +741,10 @@ fn main() {
     let link_ready_ms = std::sync::atomic::AtomicU64::new(0);
     let link_pairs: Mutex<(Vec<Vec<(u64, u64)>>, Vec<Reg>)> = Mutex::new((Vec::new(), Vec::new()));
     let thread_regs: Mutex<Vec<Reg>> = Mutex::new(Vec::new());
+    let arenas: Mutex<Vec<Arena>> = Mutex::new(Vec::new());
+    // shared table of hashed user_ids: about 2x the expected distinct long ones
+    // (one person per ~30 events, ~2 IDs each, 1 in 8 long); more spill to per-thread tables
+    init_gset((ev_bytes / 50 + cl_bytes / 35) / 64);
     let links_done = AtomicUsize::new(0);
     let link_parts: OnceLock<LinkParts> = OnceLock::new();
     if n_link_chunks == 0 {
@@ -753,16 +777,17 @@ fn main() {
                 let (s1v, s2v, s2bv) = (&s1v, &s2v, &s2bv);
                 let (chunks, maps, files, ctx) = (&chunks, &maps, &files, &ctx);
                 let (link_pairs, links_done, link_parts, link_ready_ms, thread_regs) = (&link_pairs, &links_done, &link_parts, &link_ready_ms, &thread_regs);
+                let arenas = &arenas;
                 let (ud, wrote_any, cat_names, cat_rank) = (&ud, &wrote_any, &cat_names, &cat_rank);
                 sc.spawn(move || {
                     let mut pool = Pool::new();
                     // ---------------- stage 1: parse ----------------
                     {
-                        let mut o = S1Out { ev: Scatter::new(NP1), cl: Scatter::new(NP3) };
+                        let mut o = S1Out { ev: Scatter::new(NP1), pm: Scatter::new(NPM), cl: Scatter::new(NP3) };
                         let mut masks = Masks::default();
                         let mut dc = DayCache::default();
                         let mut rbuf: Vec<u8> = Vec::new();
-                        let mut reg = Reg::default();
+                        let mut uq = UidQueue::new(tid);
                         loop {
                             let i = next1.fetch_add(1, Ordering::Relaxed);
                             let Some(c) = chunks.get(i) else { break };
@@ -794,16 +819,18 @@ fn main() {
                                         link_ready_ms.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
                                     }
                                 }
-                                1 => events_chunk(buf, cs, ce, ctx, &mut masks, &mut dc, &mut reg, &mut o.ev, &mut pool),
-                                _ => clicks_chunk(buf, cs, ce, ctx, &mut masks, &mut dc, &mut reg, &mut o.cl, &mut pool),
+                                1 => events_chunk(buf, cs, ce, ctx, &mut masks, &mut dc, &mut uq, &mut o.ev, &mut o.pm, &mut pool),
+                                _ => clicks_chunk(buf, cs, ce, ctx, &mut masks, &mut dc, &mut uq, &mut o.cl, &mut pool),
                             }
                         }
                         let _ = s1v[tid].set(o);
-                        thread_regs.lock().unwrap().push(reg);
+                        thread_regs.lock().unwrap().push(uq.reg);
+                        arenas.lock().unwrap().push(uq.ar);
                     }
                     if barrier.wait().is_leader() {
                         // nothing reads the registries before stage 3 (two barriers later)
                         publish_thread_regs(std::mem::take(&mut *thread_regs.lock().unwrap()));
+                        publish_arenas(std::mem::take(&mut *arenas.lock().unwrap()));
                         eprintln!(
                             "[{:.3}] stage1 done (link map ready at {} ms) mem {} MB",
                             t0.elapsed().as_secs_f64(),
@@ -827,6 +854,10 @@ fn main() {
                             slices.clear();
                             for t in &s1 {
                                 t.ev.each(p, |sl| slices.push((sl.as_ptr(), sl.len())));
+                            }
+                            dd.pm.clear();
+                            for t in &s1 {
+                                t.pm.each(p >> PM_SHIFT, |sl| dd.pm.extend(sl.iter().filter(|m| part1(m.eid) == p)));
                             }
                             dedup_partition(&slices, &mut dd, &mut o.uv, &mut pool);
                             // only now: the records were read in place
@@ -1019,7 +1050,7 @@ fn links_chunk(buf: &[u8], start: usize, end: usize, m: &mut Masks) -> (Vec<(u64
 }
 
 #[inline(never)]
-fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, dc: &mut DayCache, reg: &mut Reg, out: &mut Scatter<ERec>, pool: &mut Pool) {
+fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, dc: &mut DayCache, uq: &mut UidQueue, out: &mut Scatter<ERec>, pout: &mut Scatter<PMeta>, pool: &mut Pool) {
     let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -1032,7 +1063,7 @@ fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
         let ingest = f1_field(buf, f.s(3), f.e(3), dc).unwrap_or(i64::MAX / 4);
         let ingest_s = (ingest.max(0) / 1000).min(u32::MAX as i64) as u32;
         let has_uid = f.e(1) != f.s(1);
-        let ukey = if has_uid { pack_reg(buf, f.s(1), f.e(1), reg) } else { 0 };
+        let ukey = if has_uid { pack_uid(buf, f.s(1), f.e(1), uq) } else { 0 };
         let (ts, ts_ok) = match ts_at(buf, f.s(2), f.e(2), dc) {
             Some(t) => (t, (t >= ws) & (t < we)),
             None => (0, false),
@@ -1057,12 +1088,19 @@ fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
             }
         }
         let tsr = if valid { (ts - base) as u32 } else { u32::MAX };
-        out.push(part1(ekey), ERec { eid: ekey, uid: ukey, ingest: ingest_s, ts: tsr, meta }, pool);
+        let tsr = if meta != 0 {
+            pout.push(part1(ekey) >> PM_SHIFT, PMeta { eid: ekey, ingest: ingest_s, meta }, pool);
+            tsr | PURCH
+        } else {
+            tsr
+        };
+        out.push(part1(ekey), ERec { eid: ekey, uid: ukey, ingest: ingest_s, ts: tsr }, pool);
     });
+    uq.flush(buf);
 }
 
 #[inline(never)]
-fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, dc: &mut DayCache, reg: &mut Reg, out: &mut Scatter<C1>, pool: &mut Pool) {
+fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, dc: &mut DayCache, uq: &mut UidQueue, out: &mut Scatter<C1>, pool: &mut Pool) {
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
     for_lines::<4>(buf, start, end, m, |f| {
@@ -1074,14 +1112,17 @@ fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
             _ => return,
         };
         let Some(camp) = ctx.campaigns.get_at(buf, f.s(2), f.e(2)) else { return };
-        let ckey = pack_reg(buf, f.s(0), f.e(0), reg);
-        let uid = pack_reg(buf, f.s(1), f.e(1), reg);
+        let ckey = pack_cid(buf, f.s(0), f.e(0), &mut uq.ar, &mut uq.reg);
+        let uid = pack_uid(buf, f.s(1), f.e(1), uq);
         out.push(part3(uid), C1 { uid, ckey, ts: (ts - ctx.base) as u32, camp: camp as u32 }, pool);
     });
+    uq.flush(buf);
 }
 
 /// Per-thread dedup scratch.
 struct Dedup {
+    pm: Vec<PMeta>,     // the partition's purchase details
+    pmtab: Vec<u32>,    // (eid, ingest) -> index into pm + 1
     table: Vec<u32>,  // tag << kbits | k + 1 (k = record number in the partition), 0 = empty
     starts: Vec<u32>, // first record number of each slice
     dead: Vec<u64>,   // bit per record number: a copy that lost to another copy
@@ -1089,7 +1130,27 @@ struct Dedup {
 
 impl Dedup {
     fn new() -> Self {
-        Dedup { table: Vec::new(), starts: Vec::new(), dead: Vec::new() }
+        Dedup { pm: Vec::new(), pmtab: Vec::new(), table: Vec::new(), starts: Vec::new(), dead: Vec::new() }
+    }
+}
+
+#[inline(always)]
+fn pm_slot(eid: u64, ingest: u32, cap: usize) -> usize {
+    ((eid ^ (ingest as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xE703_7ED1_A0B4_28DB) >> 40) as usize & (cap - 1)
+}
+
+/// Price and category of the purchase copy (eid, ingest); it was recorded when parsed.
+#[inline(never)]
+fn purchase_meta(pm: &[PMeta], tab: &[u32], eid: u64, ingest: u32) -> u32 {
+    let mut h = pm_slot(eid, ingest, tab.len());
+    loop {
+        let i = tab[h] as usize;
+        assert!(i != 0, "purchase details recorded");
+        let m = pm[i - 1];
+        if m.eid == eid && m.ingest == ingest {
+            return m.meta;
+        }
+        h = (h + 1) & (tab.len() - 1);
     }
 }
 
@@ -1120,6 +1181,17 @@ fn dedup_partition(slices: &[(*const ERec, usize)], d: &mut Dedup, out: &mut Sca
     }
     d.dead.clear();
     d.dead.resize(n.div_ceil(64), 0);
+    // purchase details by (eid, ingest)
+    let pcap = (2 * d.pm.len()).next_power_of_two().max(16);
+    d.pmtab.clear();
+    d.pmtab.resize(pcap, 0);
+    for (i, m) in d.pm.iter().enumerate() {
+        let mut h = pm_slot(m.eid, m.ingest, pcap);
+        while d.pmtab[h] != 0 {
+            h = (h + 1) & (pcap - 1);
+        }
+        d.pmtab[h] = i as u32 + 1;
+    }
     let starts = &d.starts;
     let at = |k: usize| -> ERec {
         let si = starts.partition_point(|&s| s as usize <= k) - 1;
@@ -1176,7 +1248,8 @@ fn dedup_partition(slices: &[(*const ERec, usize)], d: &mut Dedup, out: &mut Sca
                 continue;
             }
             let uid = r.uid;
-            out.push(part3(uid), URec { uid, tm: (r.ts as u64) << 32 | r.meta as u64 }, pool);
+            let meta = if r.ts & PURCH != 0 { purchase_meta(&d.pm, &d.pmtab, r.eid, r.ingest) } else { 0 };
+            out.push(part3(uid), URec { uid, tm: ((r.ts & !PURCH) as u64) << 32 | meta as u64 }, pool);
         }
     }
 }

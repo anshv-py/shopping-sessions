@@ -506,6 +506,136 @@ impl Reg {
 static LINK_REG: OnceLock<Reg> = OnceLock::new();
 static THREAD_REGS: OnceLock<Vec<Reg>> = OnceLock::new();
 
+/// Hashed keys: FB | 62-bit hash (bit 62 clear). Arena keys (click_ids): FB | AK | arena ref.
+pub const AK: u64 = 1 << 62;
+
+/// Append-only per-thread store of ID bytes, read through 32-bit references
+/// (thread << 26 | 4-byte word offset + 1); an entry is a 4-byte length then the bytes.
+pub struct Arena {
+    tid: u32,
+    buf: Vec<u8>,
+}
+
+const AR_TID: u32 = 26;
+const AR_MAX_THREADS: usize = 64;
+
+impl Arena {
+    pub fn new(tid: usize) -> Self {
+        assert!(tid < AR_MAX_THREADS);
+        Arena { tid: tid as u32, buf: Vec::new() }
+    }
+    /// The reference of a new copy of v, or 0 when the arena is full.
+    #[inline(always)]
+    pub fn put(&mut self, v: &[u8]) -> u32 {
+        let off = self.buf.len();
+        let words = 1 + v.len().div_ceil(4);
+        if off / 4 + words >= (1 << AR_TID) - 1 {
+            return 0;
+        }
+        self.buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        self.buf.extend_from_slice(v);
+        self.buf.resize(off + 4 * words, 0);
+        (self.tid << AR_TID) | (off / 4 + 1) as u32
+    }
+}
+
+static ARENAS: OnceLock<Vec<Arena>> = OnceLock::new();
+
+/// After parsing: the arenas of every parsing thread (any order).
+pub fn publish_arenas(v: Vec<Arena>) {
+    let mut by: Vec<Arena> = (0..AR_MAX_THREADS).map(|t| Arena { tid: t as u32, buf: Vec::new() }).collect();
+    for a in v {
+        let t = a.tid as usize;
+        by[t] = a;
+    }
+    let _ = ARENAS.set(by);
+}
+
+fn arena_bytes(r: u32) -> &'static [u8] {
+    let a = &ARENAS.get().expect("arenas published")[(r >> AR_TID) as usize];
+    let o = 4 * ((r & ((1 << AR_TID) - 1)) as usize - 1);
+    let l = u32::from_le_bytes(a.buf[o..o + 4].try_into().unwrap()) as usize;
+    &a.buf[o + 4..o + 4 + l]
+}
+
+/// One table of hashed user_ids shared by all parsing threads (instead of a copy per
+/// thread): lock-free insert by compare-and-swap of the key; the inserting thread copies
+/// the bytes to its arena and stores the reference. Read (by `decode`) only after parsing.
+/// When it gets too full, inserts go to the thread's own `Reg` instead.
+pub struct GSet {
+    keys: Vec<std::sync::atomic::AtomicU64>,
+    refs: Vec<std::sync::atomic::AtomicU32>,
+    count: std::sync::atomic::AtomicUsize,
+    limit: usize,
+}
+
+static GSET: OnceLock<GSet> = OnceLock::new();
+
+/// Creates the shared table with room for about `cap` keys (call before parsing).
+pub fn init_gset(cap: usize) {
+    let cap = cap.next_power_of_two().max(1 << 14);
+    let keys = (0..cap).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let refs = (0..cap).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+    let _ = GSET.set(GSet { keys, refs, count: std::sync::atomic::AtomicUsize::new(0), limit: cap / 10 * 7 });
+}
+
+impl GSet {
+    #[inline(always)]
+    fn slot(&self, k: u64) -> usize {
+        (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & (self.keys.len() - 1)
+    }
+    /// Records k's bytes once across all threads.
+    #[inline(always)]
+    fn insert(&self, k: u64, v: &[u8], ar: &mut Arena, reg: &mut Reg) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mask = self.keys.len() - 1;
+        let mut h = self.slot(k);
+        loop {
+            let cur = unsafe { self.keys.get_unchecked(h) }.load(Relaxed);
+            if cur == k {
+                return;
+            }
+            if cur == 0 {
+                if self.count.load(Relaxed) >= self.limit {
+                    reg.insert(k, v);
+                    return;
+                }
+                match self.keys[h].compare_exchange(0, k, Relaxed, Relaxed) {
+                    Ok(_) => {
+                        self.count.fetch_add(1, Relaxed);
+                        let r = ar.put(v);
+                        if r == 0 {
+                            reg.insert(k, v);
+                        } else {
+                            self.refs[h].store(r, Relaxed);
+                        }
+                        return;
+                    }
+                    Err(now) if now == k => return,
+                    Err(_) => {}
+                }
+            }
+            h = (h + 1) & mask;
+        }
+    }
+    fn get(&self, k: u64) -> Option<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mask = self.keys.len() - 1;
+        let mut h = self.slot(k);
+        loop {
+            let cur = self.keys[h].load(Relaxed);
+            if cur == k {
+                let r = self.refs[h].load(Relaxed);
+                return if r == 0 { None } else { Some(r) };
+            }
+            if cur == 0 {
+                return None;
+            }
+            h = (h + 1) & mask;
+        }
+    }
+}
+
 pub fn publish_link_reg(r: Reg) {
     let _ = LINK_REG.set(r);
 }
@@ -515,8 +645,14 @@ pub fn publish_thread_regs(v: Vec<Reg>) {
 }
 
 fn lookup(k: u64) -> &'static [u8] {
+    if k & AK != 0 {
+        return arena_bytes(k as u32);
+    }
     if let Some(v) = LINK_REG.get().and_then(|r| r.get(k)) {
         return v;
+    }
+    if let Some(r) = GSET.get().and_then(|g| g.get(k)) {
+        return arena_bytes(r);
     }
     if let Some(rs) = THREAD_REGS.get() {
         for r in rs {
@@ -651,6 +787,89 @@ pub fn hash_bytes(v: &[u8]) -> u64 {
     hash_at(v, 0, v.len())
 }
 
+/// Hashed key of an ID that does not pack exactly (bit 62 clear: see AK).
+#[inline(always)]
+pub fn hkey(buf: &[u8], s: usize, e: usize) -> u64 {
+    FB | (hash_at(buf, s, e) >> 2)
+}
+
+/// Per-thread queue of hashed user_ids waiting to be recorded in the shared table: each
+/// one's slot is prefetched when queued, and the inserts run 32 at a time, so the table's
+/// cache misses overlap instead of stalling the parse. Holds offsets into the current
+/// buffer: `flush` before the buffer changes.
+pub struct UidQueue {
+    k: [u64; 32],
+    s: [u32; 32],
+    e: [u32; 32],
+    n: usize,
+    pub ar: Arena,
+    pub reg: Reg,
+}
+
+impl UidQueue {
+    pub fn new(tid: usize) -> Self {
+        UidQueue { k: [0; 32], s: [0; 32], e: [0; 32], n: 0, ar: Arena::new(tid), reg: Reg::default() }
+    }
+    #[inline(never)]
+    pub fn flush(&mut self, buf: &[u8]) {
+        for i in 0..self.n {
+            let (k, s, e) = (self.k[i], self.s[i] as usize, self.e[i] as usize);
+            match GSET.get() {
+                Some(g) => g.insert(k, &buf[s..e], &mut self.ar, &mut self.reg),
+                None => self.reg.insert(k, &buf[s..e]),
+            }
+        }
+        self.n = 0;
+    }
+}
+
+/// user_id key; a hashed one is queued for recording in the shared table (`UidQueue`).
+#[inline(always)]
+pub fn pack_uid(buf: &[u8], s: usize, e: usize, q: &mut UidQueue) -> u64 {
+    match pack_exact(buf, s, e) {
+        Some(k) => k,
+        None => pack_uid_slow(buf, s, e, q),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn pack_uid_slow(buf: &[u8], s: usize, e: usize, q: &mut UidQueue) -> u64 {
+    let k = hkey(buf, s, e);
+    if let Some(g) = GSET.get() {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(g.keys.as_ptr().add(g.slot(k)) as *const i8);
+        }
+    }
+    if q.n == 32 {
+        q.flush(buf);
+    }
+    let i = q.n;
+    q.k[i] = k;
+    q.s[i] = s as u32;
+    q.e[i] = e as u32;
+    q.n += 1;
+    k
+}
+
+/// click_id key: click_ids are only ever ordered (on equal ts), never matched, so a
+/// non-packing one is just a reference to a copy of its bytes.
+#[inline(always)]
+pub fn pack_cid(buf: &[u8], s: usize, e: usize, ar: &mut Arena, reg: &mut Reg) -> u64 {
+    match pack_exact(buf, s, e) {
+        Some(k) => k,
+        None => pack_cid_slow(buf, s, e, ar, reg),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn pack_cid_slow(buf: &[u8], s: usize, e: usize, ar: &mut Arena, reg: &mut Reg) -> u64 {
+    let r = ar.put(&buf[s..e]);
+    if r != 0 { FB | AK | r as u64 } else { pack_slow_reg(buf, s, e, reg) }
+}
+
 /// Key for an ID whose exact bytes matter later (names, ordering).
 #[inline(always)]
 pub fn pack_reg(buf: &[u8], s: usize, e: usize, reg: &mut Reg) -> u64 {
@@ -663,7 +882,7 @@ pub fn pack_reg(buf: &[u8], s: usize, e: usize, reg: &mut Reg) -> u64 {
 #[cold]
 #[inline(never)]
 fn pack_slow_reg(buf: &[u8], s: usize, e: usize, reg: &mut Reg) -> u64 {
-    let k = FB | (hash_at(buf, s, e) >> 1);
+    let k = hkey(buf, s, e);
     reg.insert(k, &buf[s..e]);
     k
 }
@@ -673,7 +892,7 @@ fn pack_slow_reg(buf: &[u8], s: usize, e: usize, reg: &mut Reg) -> u64 {
 pub fn pack_noreg(buf: &[u8], s: usize, e: usize) -> u64 {
     match pack_exact(buf, s, e) {
         Some(k) => k,
-        None => FB | (hash_at(buf, s, e) >> 1),
+        None => hkey(buf, s, e),
     }
 }
 
