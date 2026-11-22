@@ -1076,21 +1076,19 @@ fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
         }
         let ekey = pack_noreg(buf, f.s(0), f.e(0));
         // ingest_ts has whole seconds: parsed as seconds, in ms only for the lateness check
-        let ingest_sec = f1_secs(buf, f.s(3), f.e(3), dc).unwrap_or(i64::MAX / 4000);
+        let ingest_sec = f1_secs_or(buf, f.s(3), f.e(3), dc, i64::MAX / 4000);
         let ingest_s = ingest_sec.clamp(0, u32::MAX as i64) as u32;
         let ingest = ingest_sec * 1000;
         let has_uid = em & 2 == 0;
         let ukey = if has_uid { pack_uid(buf, f.s(1), f.e(1), uq) } else { 0 };
-        let (ts, ts_ok) = match ts_at(buf, f.s(2), f.e(2), dc) {
-            Some(t) => (t, (t >= ws) & (t < we)),
-            None => (0, false),
-        };
+        let ts = ts_raw(buf, f.s(2), f.e(2), dc);
+        let ts_ok = (ts.wrapping_sub(ws) as u64) < (we - ws) as u64; // false for TS_BAD
         // event type as integers: view / cart (len 4) or purchase (len 8)
         let tl = f.e(4) - f.s(4);
         let w4 = if tl == 4 { rd32_at(buf, f.s(4)) } else { 0 };
         let vc = (w4 == VIEW) | (w4 == CART);
         let pu = tl == 8 && rd64(buf, f.s(4)) == PURCHASE;
-        let mut valid = has_uid & ts_ok & (vc | pu) & (em & 32 == 0) & (ingest - ts <= DAY);
+        let mut valid = has_uid & ts_ok & (vc | pu) & (em & 32 == 0) & (ingest.wrapping_sub(ts) <= DAY);
         let mut meta = 0u32;
         if pu & valid {
             match parse_price(unsafe { buf.get_unchecked(f.s(6)..f.e(6)) }) {
@@ -1104,7 +1102,7 @@ fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
                 None => valid = false,
             }
         }
-        let tsr = if valid { (ts - base) as u32 } else { u32::MAX };
+        let tsr = if valid { ts.wrapping_sub(base) as u32 } else { u32::MAX };
         let tsr = if meta != 0 {
             pout.push(part1(ekey) >> PM_SHIFT, PMeta { eid: ekey, ingest: ingest_s, meta }, pool);
             tsr | PURCH
@@ -1124,10 +1122,10 @@ fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
         if f.empty_mask() & 3 != 0 {
             return;
         }
-        let ts = match ts_at(buf, f.s(3), f.e(3), dc) {
-            Some(t) if t >= lo && t < hi => t,
-            _ => return,
-        };
+        let ts = ts_raw(buf, f.s(3), f.e(3), dc);
+        if (ts.wrapping_sub(lo) as u64) >= (hi - lo) as u64 {
+            return; // out of range or TS_BAD
+        }
         let Some(camp) = ctx.campaigns.get_at(buf, f.s(2), f.e(2)) else { return };
         let ckey = pack_cid(buf, f.s(0), f.e(0), &mut uq.ar, &mut uq.reg);
         let uid = pack_uid(buf, f.s(1), f.e(1), uq);

@@ -99,8 +99,7 @@ pub struct Masks {
     del: Vec<u64>,
     nl: Vec<u64>,
     pos: Vec<u32>,
-    nlf: Vec<u64>,
-    qf: Vec<u64>,
+    fl: Vec<u8>, // per delimiter: bit 0 = newline, bit 1 = the field ending there is quoted
     cq: Vec<u32>,
 }
 
@@ -153,6 +152,7 @@ fn pext64(x: u64, m: u64) -> u64 {
 }
 
 /// 64 bits of the bit stream `v` starting at bit `i` (v must have a readable word past).
+#[allow(dead_code)]
 #[inline(always)]
 fn bits64(v: &[u64], i: usize) -> u64 {
     let w = i >> 6;
@@ -165,6 +165,7 @@ fn bits64(v: &[u64], i: usize) -> u64 {
 /// Appends `x` (its bits past the count being appended are zero) at bit `at` of a stream
 /// filled up to `at`: ORs into the current word and assigns the next, so streams need no
 /// clearing (bits past the last delimiter are stale and never inspected).
+#[allow(dead_code)]
 #[inline(always)]
 fn put_bits(v: &mut [u64], at: usize, x: u64) {
     let w = at >> 6;
@@ -175,17 +176,34 @@ fn put_bits(v: &mut [u64], at: usize, x: u64) {
     }
 }
 
-/// Index of the first set bit at or after bit `i` (one must exist).
+/// Index of the first newline flag byte at or after `i` (one must exist).
 #[cold]
 #[inline(never)]
-fn next_set(v: &[u64], i: usize) -> usize {
-    let mut w = i >> 6;
-    let mut bits = v[w] & (!0u64 << (i & 63));
-    while bits == 0 {
-        w += 1;
-        bits = v[w];
+fn next_nl(fl: &[u8], mut i: usize) -> usize {
+    while fl[i] & 1 == 0 {
+        i += 1;
     }
-    w * 64 + bits.trailing_zeros() as usize
+    i
+}
+
+/// Deposits the low bits of x at the set positions of m.
+#[inline(always)]
+fn pdep64(x: u64, m: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        std::arch::x86_64::_pdep_u64(x, m)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let (mut r, mut m, mut k) = (0u64, m, 0);
+        while m != 0 {
+            let b = m.trailing_zeros();
+            r |= ((x >> k) & 1) << b;
+            k += 1;
+            m &= m - 1;
+        }
+        r
+    }
 }
 
 /// Calls `cb` with the N fields (quotes stripped) of every well-formed line that starts
@@ -255,11 +273,9 @@ pub fn for_lines<const N: usize>(
         // words past the data are read (lookahead, virtual newline): keep them zero
         v[n / 64..words].iter_mut().for_each(|x| *x = 0);
     }
-    let sw = (n + 80) / 64 + 3; // stream words: at most n + 2 delimiters
-    for v in [&mut m.nlf, &mut m.qf] {
-        if v.len() < sw {
-            v.resize(sw, 0);
-        }
+    // at most n + 2 delimiters, plus the 16-byte writes and 8-byte reads past the last one
+    if m.fl.len() < n + 96 {
+        m.fl.resize(n + 96, 0);
     }
     if m.cq.len() < words {
         m.cq.resize(words, 0);
@@ -294,12 +310,11 @@ pub fn for_lines<const N: usize>(
     // entry 0: a virtual newline at position -1, so line starts are uniform
     let pos = m.pos.as_mut_ptr();
     unsafe { *pos = u32::MAX };
-    m.nlf[0] = 1;
-    m.qf[0] = 0;
+    m.fl[0] = 1;
     let mut np = 1usize;
     // plain slices: their pointers stay in registers across the stores below
     let (quo, del, nl): (&[u64], &[u64], &[u64]) = (&m.quo, &m.del, &m.nl);
-    let (nlf, qf, cq): (&mut [u64], &mut [u64], &mut [u32]) = (&mut m.nlf, &mut m.qf, &mut m.cq);
+    let (flp, cq): (*mut u8, &mut [u32]) = (m.fl.as_mut_ptr(), &mut m.cq);
     let mut dprev = 1u64 << 63; // the virtual delimiter at -1
     let mut qprev = 0u64;
     let mut qopen = quo[0] & 1; // the field after the previous delimiter opens with a quote
@@ -337,13 +352,24 @@ pub fn for_lines<const N: usize>(
                 k += 1;
             }
         }
-        put_bits(nlf, np, pext64(l, d));
+        let nlb = pext64(l, d);
         // field ending at delimiter j is quoted: it opens (quote after delimiter j-1) and
         // closes (quote before j, not a one-byte field) with a quote
         let open = pext64(qa, d);
         let close = pext64(qb & !d2, d);
-        put_bits(qf, np, ((open << 1) | qopen) & close);
+        let qbits = ((open << 1) | qopen) & close;
         qopen = (open >> (cnt - 1)) & 1;
+        // one flag byte per delimiter; the bytes written past this word's delimiters are 0
+        // and are overwritten by the next word's
+        unsafe {
+            (flp.add(np) as *mut u64).write_unaligned(pdep64(nlb, ONES) | (pdep64(qbits, ONES) << 1));
+            if cnt > 8 {
+                (flp.add(np + 8) as *mut u64).write_unaligned(pdep64(nlb >> 8, ONES) | (pdep64(qbits >> 8, ONES) << 1));
+                for k in 16..cnt {
+                    *flp.add(np + k) = (((nlb >> k) & 1) | (((qbits >> k) & 1) << 1)) as u8;
+                }
+            }
+        }
         np += cnt;
     }
     // 8 initialised entries past the end: the field loads below read up to 8 ahead
@@ -355,25 +381,29 @@ pub fn for_lines<const N: usize>(
     }
     let pos: &[u32] = &m.pos;
     let posp = pos.as_ptr();
-    let (nlf, qf, cq): (&[u64], &[u64], &[u32]) = (&m.nlf, &m.qf, &m.cq);
+    let (fl, cq): (&[u8], &[u32]) = (&m.fl, &m.cq);
+    let flp = fl.as_ptr();
     let quo: &[u64] = &m.quo;
     // quotes before byte p
     let qbefore = |p: usize| -> u32 {
         let w = p >> 6;
         unsafe { *cq.get_unchecked(w) + (*quo.get_unchecked(w) & ((1u64 << (p & 63)) - 1)).count_ones() }
     };
-    let want = 1u64 << (N - 1);
-    let fmask = (1u64 << N) - 1;
+    // flag bytes 0..N: newline exactly at byte N-1
+    let bm: u64 = if N == 8 { !0 } else { (1u64 << (8 * N)) - 1 };
+    let want = 1u64 << (8 * (N - 1));
     let mut f = Fields { s: [0; 8], e: [0; 8], em: 0 };
     let b0u = b0 as u32;
     let mut i = 1usize;
     let mut qs = 0u32; // quotes before the current line
     while i < np {
-        let fl = bits64(nlf, i);
-        if fl & fmask == want {
+        // the 8 flag bytes from i (bytes past the last delimiter are stale, but a line's own
+        // newline always comes before them)
+        let x = unsafe { (flp.add(i) as *const u64).read_unaligned() };
+        if x & ONES & bm == want {
             // N-1 commas, then the newline; field k spans delimiters i-1+k .. i+k
             let le = unsafe { *pos.get_unchecked(i + N - 1) } as usize;
-            let pm = bits64(qf, i) & fmask; // quoted fields
+            let qb8 = (x >> 1) & ONES & bm; // byte k = 1: field k is quoted
             // field k: start = pos[i-1+k] + 1 + d, end = pos[i+k] - d (d = 1 if quoted)
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             unsafe {
@@ -382,7 +412,7 @@ pub fn for_lines<const N: usize>(
                 let p1 = _mm256_loadu_si256(posp.add(i) as *const __m256i);
                 let one = _mm256_set1_epi32(1);
                 let bv = _mm256_set1_epi32(b0u as i32);
-                let d = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(pm as i32), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7)), one);
+                let d = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(qb8 as i64));
                 // p0 + 1 + d + b0 (entry -1 is u32::MAX: + 1 wraps to 0)
                 let sv = _mm256_add_epi32(_mm256_add_epi32(p0, _mm256_add_epi32(bv, one)), d);
                 let ev = _mm256_add_epi32(_mm256_sub_epi32(p1, d), bv);
@@ -394,7 +424,7 @@ pub fn for_lines<const N: usize>(
             {
                 f.em = 0;
                 for k in 0..N {
-                    let d = ((pm >> k) & 1) as u32;
+                    let d = ((qb8 >> (8 * k)) & 1) as u32;
                     f.s[k] = unsafe { *posp.add(i - 1 + k) }.wrapping_add(1) + d + b0u;
                     f.e[k] = unsafe { *posp.add(i + k) } - d + b0u;
                     f.em |= ((f.s[k] == f.e[k]) as u32) << k;
@@ -406,13 +436,14 @@ pub fn for_lines<const N: usize>(
             let quotes = qe - qs;
             qs = qe;
             // single call site, so the callback inlines into the loop
-            if quotes == 2 * pm.count_ones() {
+            if quotes == 2 * qb8.count_ones() {
                 cb(&f);
             }
             i += N;
         } else {
             // malformed: skip to the delimiter that ends the line
-            let k = if fl != 0 { i + fl.trailing_zeros() as usize } else { next_set(nlf, i) };
+            let nx = x & ONES;
+            let k = if nx != 0 { i + (nx.trailing_zeros() / 8) as usize } else { next_nl(fl, i + 8) };
             qs = qbefore(unsafe { *pos.get_unchecked(k) } as usize);
             i = k + 1;
         }
@@ -1234,6 +1265,15 @@ fn hm(b: u64) -> Option<(i64, i64)> {
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 fn hms_simd(buf: &[u8], s: usize, z: bool) -> Option<(i64, u32)> {
+    let (ok, t, dd) = hms_parts(buf, s, z);
+    if ok { Some((t, dd)) } else { None }
+}
+
+/// `hms_simd` without the branch: (valid, h * 3600 + m * 60 + s, day of month); the values
+/// are garbage when not valid.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn hms_parts(buf: &[u8], s: usize, z: bool) -> (bool, i64, u32) {
     use std::arch::x86_64::*;
     unsafe {
         let v = _mm_loadu_si128(buf.as_ptr().add(s + 4) as *const __m128i);
@@ -1253,24 +1293,34 @@ fn hms_simd(buf: &[u8], s: usize, z: bool) -> Option<(i64, u32)> {
         // range check in one compare: lanes over (23, 59, 59, 31, 0, ...) are bad (the day's
         // lower bound and month length are checked by the caller)
         let over = _mm_movemask_epi8(_mm_cmpgt_epi16(m, _mm_setr_epi16(23, 59, 59, 31, 0, 0, 0, 0))) as u32;
-        if (ok & want != want) | (over != 0) {
-            return None;
-        }
+        let good = (ok & want == want) & (over == 0);
         // h * 3600 + mi * 60 in i32 lane 0, se in lane 1
         let hm = _mm_madd_epi16(m, _mm_setr_epi16(3600, 60, 1, 0, 0, 0, 0, 0));
         let x = _mm_cvtsi128_si64(hm) as u64;
         let dd = _mm_extract_epi16::<3>(m) as u32;
-        Some(((x as u32 as i64) + (x >> 32) as i64, dd))
+        (good, (x as u32 as i64) + (x >> 32) as i64, dd)
     }
 }
 
-/// F1 `YYYY-MM-DDTHH:MM:SSZ` at buf[s..s+20], in seconds.
+/// F1 `YYYY-MM-DDTHH:MM:SSZ` at buf[s..s+20], in seconds: (valid, value; garbage if not).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn f1_sec_raw(buf: &[u8], s: usize, dc: &mut DayCache) -> (bool, i64) {
+    let (ok, t, dd) = hms_parts(buf, s, true);
+    let a = rd64(buf, s);
+    let idx = ((a >> 48) & 15) as usize;
+    if dc.ma[idx] != a {
+        month_fill(a, dc, idx);
+    }
+    let ok = ok & (dd.wrapping_sub(1) < dc.mdim[idx]);
+    (ok, (dc.mbase[idx] as i64 + dd as i64) * 86_400 + t)
+}
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 fn f1_sec_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
-    let (t, dd) = hms_simd(buf, s, true)?;
-    let days = month_days(rd64(buf, s), dd, dc)?;
-    Some(days * 86_400 + t)
+    let (ok, v) = f1_sec_raw(buf, s, dc);
+    if ok { Some(v) } else { None }
 }
 
 /// F1 `YYYY-MM-DDTHH:MM:SSZ` at buf[s..s+20].
@@ -1284,6 +1334,15 @@ fn f1_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
 #[inline(always)]
 fn f1_sec_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
     Some(f1_at(buf, s, dc)? / 1000)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn f1_sec_raw(buf: &[u8], s: usize, dc: &mut DayCache) -> (bool, i64) {
+    match f1_sec_at(buf, s, dc) {
+        Some(v) => (true, v),
+        None => (false, 0),
+    }
 }
 
 /// F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` at buf[s..s+25].
@@ -1357,7 +1416,53 @@ fn f2_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
     Some(if sign == 0x2B { t - off } else { t + off })
 }
 
+/// pshufb masks moving the first `len` bytes to the top lanes (zeros below).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+static F3_SHUF: [[i8; 16]; 17] = {
+    let mut t = [[-128i8; 16]; 17];
+    let mut len = 0;
+    while len <= 16 {
+        let mut j = 16 - len;
+        while j < 16 {
+            t[len][j] = (j - (16 - len)) as i8;
+            j += 1;
+        }
+        len += 1;
+    }
+    t
+};
+
+/// F3 digits at buf[s..s+len] (1..=16, with 16 readable bytes from s): (valid, value).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn f3_raw(buf: &[u8], s: usize, len: usize) -> (bool, i64) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm_loadu_si128(buf.as_ptr().add(s) as *const __m128i);
+        let t = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+        let dm = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(t, _mm_set1_epi8(9)), t)) as u32;
+        let lm = (1u32 << len) - 1;
+        let a = _mm_shuffle_epi8(t, _mm_loadu_si128(F3_SHUF.get_unchecked(len).as_ptr() as *const __m128i));
+        let m1 = _mm_maddubs_epi16(a, _mm_set1_epi16(0x010A)); // 2-digit groups
+        let m2 = _mm_madd_epi16(m1, _mm_set1_epi32(0x0001_0064)); // 4-digit groups
+        let m3 = _mm_packus_epi32(m2, m2);
+        let m4 = _mm_madd_epi16(m3, _mm_set1_epi32(0x0001_2710)); // 8-digit groups
+        let x = _mm_cvtsi128_si64(m4) as u64;
+        ((dm & lm) == lm, (x as u32 as i64) * 100_000_000 + (x >> 32) as i64)
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn f3_raw(buf: &[u8], s: usize, len: usize) -> (bool, i64) {
+    match f3_at(buf, s, s + len) {
+        Some(v) => (true, v),
+        None => (false, 0),
+    }
+}
+
 /// F3 digits at buf[s..e] (1..=16 of them, with 16 readable bytes from s).
+#[allow(dead_code)]
 #[inline(always)]
 fn f3_at(buf: &[u8], s: usize, e: usize) -> Option<i64> {
     let len = e - s;
@@ -1383,20 +1488,79 @@ fn f3_at(buf: &[u8], s: usize, e: usize) -> Option<i64> {
     }
 }
 
-/// Event/click `ts` of buf[s..e]; falls back to `parse_ts` off the fast paths.
+/// Invalid timestamp from `ts_raw` (no valid one is this small).
+pub const TS_BAD: i64 = i64::MIN;
+
+/// Event/click `ts` of buf[s..e] in ms, TS_BAD when invalid; falls back to `parse_ts` off
+/// the fast paths.
 #[inline(always)]
-pub fn ts_at(buf: &[u8], s: usize, e: usize, dc: &mut DayCache) -> Option<i64> {
+pub fn ts_raw(buf: &[u8], s: usize, e: usize, dc: &mut DayCache) -> i64 {
     let len = e - s;
     if len == 20 && unsafe { *buf.get_unchecked(s + 19) } == b'Z' {
-        return f1_at(buf, s, dc);
+        let (ok, v) = f1_sec_raw(buf, s, dc);
+        return if ok { v * 1000 } else { TS_BAD };
     }
     if len >= 1 && len <= 16 && s + 16 <= buf.len() && unsafe { *buf.get_unchecked(s) }.wrapping_sub(b'0') < 10 {
-        return f3_at(buf, s, e);
+        let (ok, v) = f3_raw(buf, s, len);
+        return if ok { v } else { TS_BAD };
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     if len == 25 {
-        return f2_at(buf, s, dc);
+        return f2_raw(buf, s, dc);
     }
-    parse_ts(&buf[s..e])
+    ts_rare(buf, s, e, dc)
+}
+
+#[inline(never)]
+fn ts_rare(buf: &[u8], s: usize, e: usize, dc: &mut DayCache) -> i64 {
+    let r = if e - s == 25 { f2_at(buf, s, dc) } else { parse_ts(&buf[s..e]) };
+    r.unwrap_or(TS_BAD)
+}
+
+/// F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` at buf[s..s+25] in ms, branch-free; TS_BAD if invalid.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn f2_raw(buf: &[u8], s: usize, dc: &mut DayCache) -> i64 {
+    let (ok, t, dd) = hms_parts(buf, s, false);
+    let x = rd64(buf, s + 17); // S S sign H H : M M
+    let sign = (x >> 16) & 0xFF;
+    let dx = x & 0x0F0F_0F0F_0F0F_0F0F;
+    let tx = dx.wrapping_mul(10).wrapping_add(dx >> 8);
+    let oh = ((tx >> 24) & 0xFF) as i64;
+    let om = ((tx >> 48) & 0xFF) as i64;
+    let ok = ok
+        & (((x >> 40) & 0xFF) == 0x3A)
+        & digits_ok(x, lane_mask(&[3, 4, 6, 7]))
+        & ((sign == 0x2B) | (sign == 0x2D))
+        & (oh <= 23)
+        & (om <= 59);
+    let a = rd64(buf, s);
+    let idx = ((a >> 48) & 15) as usize;
+    if dc.ma[idx] != a {
+        month_fill(a, dc, idx);
+    }
+    let ok = ok & (dd.wrapping_sub(1) < dc.mdim[idx]);
+    let v = ((dc.mbase[idx] as i64 + dd as i64) * 86_400 + t) * 1000;
+    let off = (oh * 60 + om) * 60_000;
+    let v = if sign == 0x2B { v - off } else { v + off };
+    if ok { v } else { TS_BAD }
+}
+
+/// `ts_raw` as an Option.
+#[inline(always)]
+pub fn ts_at(buf: &[u8], s: usize, e: usize, dc: &mut DayCache) -> Option<i64> {
+    let v = ts_raw(buf, s, e, dc);
+    if v == TS_BAD { None } else { Some(v) }
+}
+
+/// ingest_ts (always F1) in seconds, or `bad`.
+#[inline(always)]
+pub fn f1_secs_or(buf: &[u8], s: usize, e: usize, dc: &mut DayCache, bad: i64) -> i64 {
+    if e - s != 20 {
+        return bad; // (the loads below need the 20 bytes)
+    }
+    let (ok, v) = f1_sec_raw(buf, s, dc);
+    if ok { v } else { bad }
 }
 
 /// ingest_ts (always F1), in seconds.
@@ -1534,6 +1698,7 @@ mod tests {
             if s.len() == 20 {
                 assert_eq!(f1_field(&buf, 0, 20, &mut dc), if s[19] == b'Z' { parse_ts(&s) } else { None });
                 assert_eq!(f1_secs(&buf, 0, 20, &mut dc), f1_field(&buf, 0, 20, &mut dc).map(|v| v / 1000));
+                assert_eq!(f1_secs_or(&buf, 0, 20, &mut dc, -7), f1_secs(&buf, 0, 20, &mut dc).unwrap_or(-7));
             }
         }
     }
