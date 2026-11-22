@@ -1,8 +1,7 @@
 //! CSV dialect, timestamps, prices and ID keys.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 /// Position just after the next '\n' at or after `i` (or the buffer end).
 #[inline(always)]
@@ -418,14 +417,125 @@ pub fn for_lines<const N: usize>(
 //
 // An ID of at most 9 bytes, all ASCII 0x01..=0x7F, packs exactly into 63 bits: 7 bits per
 // byte, first byte most significant, zero padded. Numeric order == byte-wise order. Any
-// other ID gets FB | hash, with its bytes registered so names and ordering stay exact.
+// other ID gets FB | 63-bit hash; IDs whose bytes matter later (names, ordering) are
+// recorded in a registry (one per parsing thread, no locks), published read-only once
+// parsing is done.
 
 pub const FB: u64 = 1 << 63;
 
-static FALLBACK: OnceLock<Mutex<HashMap<u64, Vec<u8>>>> = OnceLock::new();
+/// Bytes of hashed (FB) keys: open addressing over keys, values index `arena`
+/// (4-byte length then the bytes).
+#[derive(Default)]
+pub struct Reg {
+    keys: Vec<u64>, // 0 = empty slot (every stored key has FB set)
+    offs: Vec<u32>,
+    arena: Vec<u8>,
+    n: usize,
+}
 
-fn registry() -> &'static Mutex<HashMap<u64, Vec<u8>>> {
-    FALLBACK.get_or_init(|| Mutex::new(HashMap::new()))
+impl Reg {
+    #[inline(always)]
+    fn slot(k: u64, mask: usize) -> usize {
+        (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask
+    }
+    pub fn len(&self) -> usize {
+        self.n
+    }
+    pub fn insert(&mut self, k: u64, v: &[u8]) {
+        if 2 * (self.n + 1) > self.keys.len() {
+            self.grow();
+        }
+        let mask = self.keys.len() - 1;
+        let mut h = Self::slot(k, mask);
+        loop {
+            let t = unsafe { *self.keys.get_unchecked(h) };
+            if t == k {
+                return;
+            }
+            if t == 0 {
+                break;
+            }
+            h = (h + 1) & mask;
+        }
+        self.keys[h] = k;
+        self.offs[h] = self.arena.len() as u32;
+        self.arena.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        self.arena.extend_from_slice(v);
+        self.n += 1;
+    }
+    #[cold]
+    fn grow(&mut self) {
+        let cap = (self.keys.len() * 2).max(1024);
+        let old_k = std::mem::replace(&mut self.keys, vec![0; cap]);
+        let old_o = std::mem::replace(&mut self.offs, vec![0; cap]);
+        let mask = cap - 1;
+        for (i, &k) in old_k.iter().enumerate() {
+            if k != 0 {
+                let mut h = Self::slot(k, mask);
+                while self.keys[h] != 0 {
+                    h = (h + 1) & mask;
+                }
+                self.keys[h] = k;
+                self.offs[h] = old_o[i];
+            }
+        }
+    }
+    pub fn get(&self, k: u64) -> Option<&[u8]> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        let mask = self.keys.len() - 1;
+        let mut h = Self::slot(k, mask);
+        loop {
+            let t = self.keys[h];
+            if t == k {
+                let o = self.offs[h] as usize;
+                let l = u32::from_le_bytes(self.arena[o..o + 4].try_into().unwrap()) as usize;
+                return Some(&self.arena[o + 4..o + 4 + l]);
+            }
+            if t == 0 {
+                return None;
+            }
+            h = (h + 1) & mask;
+        }
+    }
+    /// Every (key, bytes) entry.
+    pub fn each(&self, mut f: impl FnMut(u64, &[u8])) {
+        for (i, &k) in self.keys.iter().enumerate() {
+            if k != 0 {
+                let o = self.offs[i] as usize;
+                let l = u32::from_le_bytes(self.arena[o..o + 4].try_into().unwrap()) as usize;
+                f(k, &self.arena[o + 4..o + 4 + l]);
+            }
+        }
+    }
+}
+
+/// Registries readable by `decode` / `key_cmp`: the link registry (set before link
+/// naming), then the parsing threads' (set after parsing).
+static LINK_REG: OnceLock<Reg> = OnceLock::new();
+static THREAD_REGS: OnceLock<Vec<Reg>> = OnceLock::new();
+
+pub fn publish_link_reg(r: Reg) {
+    let _ = LINK_REG.set(r);
+}
+
+pub fn publish_thread_regs(v: Vec<Reg>) {
+    let _ = THREAD_REGS.set(v);
+}
+
+fn lookup(k: u64) -> &'static [u8] {
+    if let Some(v) = LINK_REG.get().and_then(|r| r.get(k)) {
+        return v;
+    }
+    if let Some(rs) = THREAD_REGS.get() {
+        for r in rs {
+            if let Some(v) = r.get(k) {
+                return v;
+            }
+        }
+    }
+    panic!("fallback key registered")
 }
 
 const ONES: u64 = 0x0101_0101_0101_0101;
@@ -498,36 +608,57 @@ fn pack_exact(buf: &[u8], s: usize, e: usize) -> Option<u64> {
     }
 }
 
-pub fn hash_bytes(s: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in s {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0100_0000_01b3);
+#[inline(always)]
+fn mum(a: u64, b: u64) -> u64 {
+    let r = a as u128 * b as u128;
+    (r as u64) ^ ((r >> 64) as u64)
+}
+
+/// 64-bit hash of buf[s..e], 8 bytes at a time (reads stay inside [s, e)).
+#[inline(always)]
+pub fn hash_at(buf: &[u8], s: usize, e: usize) -> u64 {
+    const K: [u64; 4] = [0xa076_1d64_78bd_642f, 0xe703_7ed1_a0b4_28db, 0x8ebc_6af0_9c88_c6e3, 0x5899_65cc_7537_4cc3];
+    let len = e - s;
+    let mut h = (len as u64).wrapping_mul(K[0]) ^ K[1];
+    if len >= 8 {
+        let mut i = s;
+        while i + 16 <= e {
+            h = mum(rd64(buf, i) ^ K[2], rd64(buf, i + 8) ^ h);
+            i += 16;
+        }
+        if i < e {
+            // the last 1..=15 bytes, read as two (possibly overlapping) words ending at e
+            let a = if e - i > 8 { rd64(buf, i) } else { 0 };
+            h = mum(a ^ K[3], rd64(buf, e - 8) ^ h ^ K[0]);
+        }
+    } else {
+        let mut x = 0u64;
+        for i in s..e {
+            x = (x << 8) | buf[i] as u64;
+        }
+        h = mum(x ^ K[3], h);
     }
-    h ^= s.len() as u64;
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    h ^= h >> 33;
-    h
+    mum(h ^ K[1], (len as u64) ^ K[2])
+}
+
+pub fn hash_bytes(v: &[u8]) -> u64 {
+    hash_at(v, 0, v.len())
 }
 
 /// Key for an ID whose exact bytes matter later (names, ordering).
 #[inline(always)]
-pub fn pack_reg(buf: &[u8], s: usize, e: usize) -> u64 {
+pub fn pack_reg(buf: &[u8], s: usize, e: usize, reg: &mut Reg) -> u64 {
     match pack_exact(buf, s, e) {
         Some(k) => k,
-        None => pack_slow_reg(&buf[s..e]),
+        None => pack_slow_reg(buf, s, e, reg),
     }
 }
 
 #[cold]
 #[inline(never)]
-fn pack_slow_reg(v: &[u8]) -> u64 {
-    let k = FB | (hash_bytes(v) >> 1);
-    let mut m = registry().lock().unwrap();
-    m.entry(k).or_insert_with(|| v.to_vec());
+fn pack_slow_reg(buf: &[u8], s: usize, e: usize, reg: &mut Reg) -> u64 {
+    let k = FB | (hash_at(buf, s, e) >> 1);
+    reg.insert(k, &buf[s..e]);
     k
 }
 
@@ -536,23 +667,32 @@ fn pack_slow_reg(v: &[u8]) -> u64 {
 pub fn pack_noreg(buf: &[u8], s: usize, e: usize) -> u64 {
     match pack_exact(buf, s, e) {
         Some(k) => k,
-        None => FB | (hash_bytes(&buf[s..e]) >> 1),
+        None => FB | (hash_at(buf, s, e) >> 1),
+    }
+}
+
+/// The bytes of key k (exact keys are unpacked into tmp).
+#[inline]
+pub fn key_bytes(k: u64, tmp: &mut [u8; 9]) -> &[u8] {
+    if k & FB == 0 {
+        let mut n = 0;
+        while n < 9 {
+            let c = (k >> (56 - 7 * n)) & 0x7F;
+            if c == 0 {
+                break;
+            }
+            tmp[n] = c as u8;
+            n += 1;
+        }
+        &tmp[..n]
+    } else {
+        lookup(k)
     }
 }
 
 pub fn decode(k: u64, out: &mut Vec<u8>) {
-    if k & FB == 0 {
-        for i in 0..9 {
-            let c = (k >> (56 - 7 * i)) & 0x7F;
-            if c == 0 {
-                break;
-            }
-            out.push(c as u8);
-        }
-    } else {
-        let m = registry().lock().unwrap();
-        out.extend_from_slice(m.get(&k).expect("fallback key registered"));
-    }
+    let mut t = [0u8; 9];
+    out.extend_from_slice(key_bytes(k, &mut t));
 }
 
 #[inline(always)]
@@ -560,11 +700,16 @@ pub fn key_cmp(a: u64, b: u64) -> Ordering {
     if (a | b) & FB == 0 {
         return a.cmp(&b);
     }
-    let mut x = Vec::new();
-    let mut y = Vec::new();
-    decode(a, &mut x);
-    decode(b, &mut y);
-    x.cmp(&y)
+    key_cmp_slow(a, b)
+}
+
+#[inline(never)]
+fn key_cmp_slow(a: u64, b: u64) -> Ordering {
+    if a == b {
+        return Ordering::Equal;
+    }
+    let (mut x, mut y) = ([0u8; 9], [0u8; 9]);
+    key_bytes(a, &mut x).cmp(key_bytes(b, &mut y))
 }
 
 #[inline(always)]
@@ -1159,26 +1304,50 @@ mod tests {
     #[test]
     fn keys_order_and_roundtrip() {
         let mut r = Rng(0xfeed_beef_1234_5678);
-        let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyzABCZ_ \t\r\"\x01\x7f\xc3\xa9";
-        let mut prev: Option<(Vec<u8>, u64)> = None;
-        for _ in 0..2_000_000 {
+        let alphabet = b"0123456789abcdefghijklmnopqrstuvwxyzABCZ_ \t\r\"\x01\x7f\xc3\xa9\x00\x80\xff\x7e";
+        let hex = b"0123456789abcdef";
+        let mut reg = Reg::default();
+        let mut all: Vec<(Vec<u8>, u64)> = Vec::new();
+        for i in 0..2_000_000 {
             let len = r.below(12) as usize;
-            let s: Vec<u8> = (0..len).map(|_| alphabet[r.below(alphabet.len() as u64) as usize]).collect();
+            let mut s: Vec<u8> = (0..len).map(|_| alphabet[r.below(alphabet.len() as u64) as usize]).collect();
+            if i % 4 == 0 {
+                // v5-style long IDs: short base-36 part plus a 32-character hex suffix
+                s.truncate(9);
+                for _ in 0..32 {
+                    s.push(hex[r.below(16) as usize]);
+                }
+            }
             let mut buf = s.clone();
             for _ in 0..r.below(12) {
-                buf.push(b'x');
+                buf.push(alphabet[r.below(alphabet.len() as u64) as usize]);
             }
-            let k = pack_reg(&buf, 0, s.len());
-            let mut d = Vec::new();
-            decode(k, &mut d);
-            assert_eq!(d, s);
+            let k = pack_reg(&buf, 0, s.len(), &mut reg);
+            let exact = s.len() <= 9 && s.iter().all(|&c| (1..=0x7F).contains(&c));
+            assert_eq!(k & FB == 0, exact, "{:?}", s);
+            assert_eq!(pack_noreg(&buf, 0, s.len()), k);
             if s.is_empty() {
                 assert_eq!(k, 0);
             }
-            if let Some((ps, pk)) = &prev {
-                assert_eq!(key_cmp(*pk, k), ps.cmp(&s), "{:?} {:?}", ps, s);
+            all.push((s, k));
+        }
+        publish_link_reg(reg);
+        let mut d = Vec::new();
+        for (i, (s, k)) in all.iter().enumerate() {
+            d.clear();
+            decode(*k, &mut d);
+            assert_eq!(&d, s);
+            if i > 0 {
+                let (ps, pk) = &all[i - 1];
+                assert_eq!(key_cmp(*pk, *k), ps.cmp(s), "{:?} {:?}", ps, s);
             }
-            prev = Some((s, k));
+        }
+        // distinct IDs never share a key
+        let mut m: std::collections::HashMap<u64, &Vec<u8>> = std::collections::HashMap::new();
+        for (s, k) in &all {
+            if let Some(o) = m.insert(*k, s) {
+                assert_eq!(o, s, "key collision");
+            }
         }
     }
 }

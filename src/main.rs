@@ -332,7 +332,16 @@ impl LocalMap {
 }
 
 #[inline(never)]
-fn build_links(pairs: &[Vec<(u64, u64)>]) -> LinkParts {
+fn build_links(pairs: &[Vec<(u64, u64)>], regs: Vec<Reg>) -> LinkParts {
+    // one registry for the link IDs, readable by key_cmp from here on
+    let mut regs = regs;
+    regs.sort_by_key(|r| std::cmp::Reverse(r.len()));
+    let mut it = regs.into_iter();
+    let mut lreg = it.next().unwrap_or_default();
+    for r in it {
+        r.each(|k, v| lreg.insert(k, v));
+    }
+    publish_link_reg(lreg);
     let m: usize = pairs.iter().map(|v| v.len()).sum();
     if m == 0 {
         return LinkParts { off: vec![0; NP3 + 1], ent: Vec::new() };
@@ -642,6 +651,7 @@ fn main() {
         let mut pool = Pool::new();
         let mut bm = Masks::default();
         let mut dc = DayCache::default();
+        let mut breg = Reg::default();
         let mut best = f64::MAX;
         for _ in 0..reps {
             let mut sc: Scatter<ERec> = Scatter::new(NP1);
@@ -653,7 +663,7 @@ fn main() {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| acc += f.e(6));
                 } else if mode == "keys" {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
-                        acc += (pack_noreg(buf, f.s(0), f.e(0)) ^ pack_reg(buf, f.s(1), f.e(1))) as usize
+                        acc += (pack_noreg(buf, f.s(0), f.e(0)) ^ pack_reg(buf, f.s(1), f.e(1), &mut breg)) as usize
                     });
                 } else if mode == "ts" {
                     for_lines::<7>(buf, c.start, c.end, &mut bm, |f| {
@@ -670,7 +680,7 @@ fn main() {
                         sc.push(part1(k), ERec { eid: k, uid: f.s(1) as u64, ingest: 0, ts: 0, meta: 0 }, &mut pool)
                     });
                 } else {
-                    events_chunk(buf, c.start, c.end, &ctx, &mut bm, &mut dc, &mut sc, &mut pool);
+                    events_chunk(buf, c.start, c.end, &ctx, &mut bm, &mut dc, &mut breg, &mut sc, &mut pool);
                 }
             }
             best = best.min(t.elapsed().as_secs_f64());
@@ -709,7 +719,8 @@ fn main() {
     }
     let _ = (populate, willneed);
     let link_ready_ms = std::sync::atomic::AtomicU64::new(0);
-    let link_pairs: Mutex<Vec<Vec<(u64, u64)>>> = Mutex::new(Vec::new());
+    let link_pairs: Mutex<(Vec<Vec<(u64, u64)>>, Vec<Reg>)> = Mutex::new((Vec::new(), Vec::new()));
+    let thread_regs: Mutex<Vec<Reg>> = Mutex::new(Vec::new());
     let links_done = AtomicUsize::new(0);
     let link_parts: OnceLock<LinkParts> = OnceLock::new();
     if n_link_chunks == 0 {
@@ -741,7 +752,7 @@ fn main() {
                 let (barrier, next1, next2, next2b, next3) = (&barrier, &next1, &next2, &next2b, &next3);
                 let (s1v, s2v, s2bv) = (&s1v, &s2v, &s2bv);
                 let (chunks, maps, files, ctx) = (&chunks, &maps, &files, &ctx);
-                let (link_pairs, links_done, link_parts, link_ready_ms) = (&link_pairs, &links_done, &link_parts, &link_ready_ms);
+                let (link_pairs, links_done, link_parts, link_ready_ms, thread_regs) = (&link_pairs, &links_done, &link_parts, &link_ready_ms, &thread_regs);
                 let (ud, wrote_any, cat_names, cat_rank) = (&ud, &wrote_any, &cat_names, &cat_rank);
                 sc.spawn(move || {
                     let mut pool = Pool::new();
@@ -751,6 +762,7 @@ fn main() {
                         let mut masks = Masks::default();
                         let mut dc = DayCache::default();
                         let mut rbuf: Vec<u8> = Vec::new();
+                        let mut reg = Reg::default();
                         loop {
                             let i = next1.fetch_add(1, Ordering::Relaxed);
                             let Some(c) = chunks.get(i) else { break };
@@ -769,22 +781,29 @@ fn main() {
                             }
                             match c.kind {
                                 0 => {
-                                    let v = links_chunk(buf, cs, ce, &mut masks);
-                                    link_pairs.lock().unwrap().push(v);
+                                    let (v, r) = links_chunk(buf, cs, ce, &mut masks);
+                                    {
+                                        let mut g = link_pairs.lock().unwrap();
+                                        g.0.push(v);
+                                        g.1.push(r);
+                                    }
                                     if links_done.fetch_add(1, Ordering::AcqRel) + 1 == n_link_chunks {
-                                        let pairs = std::mem::take(&mut *link_pairs.lock().unwrap());
-                                        let lp = build_links(&pairs);
+                                        let (pairs, regs) = std::mem::take(&mut *link_pairs.lock().unwrap());
+                                        let lp = build_links(&pairs, regs);
                                         let _ = link_parts.set(lp);
                                         link_ready_ms.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
                                     }
                                 }
-                                1 => events_chunk(buf, cs, ce, ctx, &mut masks, &mut dc, &mut o.ev, &mut pool),
-                                _ => clicks_chunk(buf, cs, ce, ctx, &mut masks, &mut dc, &mut o.cl, &mut pool),
+                                1 => events_chunk(buf, cs, ce, ctx, &mut masks, &mut dc, &mut reg, &mut o.ev, &mut pool),
+                                _ => clicks_chunk(buf, cs, ce, ctx, &mut masks, &mut dc, &mut reg, &mut o.cl, &mut pool),
                             }
                         }
                         let _ = s1v[tid].set(o);
+                        thread_regs.lock().unwrap().push(reg);
                     }
                     if barrier.wait().is_leader() {
+                        // nothing reads the registries before stage 3 (two barriers later)
+                        publish_thread_regs(std::mem::take(&mut *thread_regs.lock().unwrap()));
                         eprintln!(
                             "[{:.3}] stage1 done (link map ready at {} ms) mem {} MB",
                             t0.elapsed().as_secs_f64(),
@@ -980,18 +999,19 @@ fn load_chunk(f: &std::fs::File, flen: usize, start: usize, end: usize, buf: &mu
 }
 
 #[inline(never)]
-fn links_chunk(buf: &[u8], start: usize, end: usize, m: &mut Masks) -> Vec<(u64, u64)> {
+fn links_chunk(buf: &[u8], start: usize, end: usize, m: &mut Masks) -> (Vec<(u64, u64)>, Reg) {
     let mut v = Vec::with_capacity((end - start) / 20 + 16);
+    let mut reg = Reg::default();
     for_lines::<2>(buf, start, end, m, |f| {
         if f.e(0) > f.s(0) && f.e(1) > f.s(1) {
-            v.push((pack_reg(buf, f.s(0), f.e(0)), pack_reg(buf, f.s(1), f.e(1))));
+            v.push((pack_reg(buf, f.s(0), f.e(0), &mut reg), pack_reg(buf, f.s(1), f.e(1), &mut reg)));
         }
     });
-    v
+    (v, reg)
 }
 
 #[inline(never)]
-fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, dc: &mut DayCache, out: &mut Scatter<ERec>, pool: &mut Pool) {
+fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, dc: &mut DayCache, reg: &mut Reg, out: &mut Scatter<ERec>, pool: &mut Pool) {
     let (ws, we, base) = (ctx.ws, ctx.we, ctx.base);
     const VIEW: u32 = u32::from_le_bytes(*b"view");
     const CART: u32 = u32::from_le_bytes(*b"cart");
@@ -1004,7 +1024,7 @@ fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
         let ingest = f1_field(buf, f.s(3), f.e(3), dc).unwrap_or(i64::MAX / 4);
         let ingest_s = (ingest.max(0) / 1000).min(u32::MAX as i64) as u32;
         let has_uid = f.e(1) != f.s(1);
-        let ukey = if has_uid { pack_reg(buf, f.s(1), f.e(1)) } else { 0 };
+        let ukey = if has_uid { pack_reg(buf, f.s(1), f.e(1), reg) } else { 0 };
         let (ts, ts_ok) = match ts_at(buf, f.s(2), f.e(2), dc) {
             Some(t) => (t, (t >= ws) & (t < we)),
             None => (0, false),
@@ -1034,7 +1054,7 @@ fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
 }
 
 #[inline(never)]
-fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, dc: &mut DayCache, out: &mut Scatter<C1>, pool: &mut Pool) {
+fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, dc: &mut DayCache, reg: &mut Reg, out: &mut Scatter<C1>, pool: &mut Pool) {
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
     for_lines::<4>(buf, start, end, m, |f| {
@@ -1046,8 +1066,8 @@ fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
             _ => return,
         };
         let Some(camp) = ctx.campaigns.get_at(buf, f.s(2), f.e(2)) else { return };
-        let ckey = pack_reg(buf, f.s(0), f.e(0));
-        let uid = pack_reg(buf, f.s(1), f.e(1));
+        let ckey = pack_reg(buf, f.s(0), f.e(0), reg);
+        let uid = pack_reg(buf, f.s(1), f.e(1), reg);
         out.push(part3(uid), C1 { uid, ckey, ts: (ts - ctx.base) as u32, camp: camp as u32 }, pool);
     });
 }

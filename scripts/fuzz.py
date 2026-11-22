@@ -3,6 +3,7 @@
 
 Usage: fuzz.py BINARY ITERATIONS
 """
+import hashlib
 import os
 import random
 import shutil
@@ -55,7 +56,28 @@ def retag(line, tag):
     return head + line[i:]
 
 
+def lengthen(v):
+    """v5-style IDs: about a third of ID values get a 32-hex suffix, the same in every file."""
+    q = len(v) >= 2 and v[0] == '"' and v[-1] == '"'
+    w = v[1:-1] if q else v
+    if w == "" or '"' in w:
+        return v
+    h = hashlib.md5(w.encode("utf-8", "surrogateescape")).hexdigest()
+    if int(h[0], 16) % 3 != 0:
+        return v
+    w = w + h
+    return '"' + w + '"' if q else w
+
+
+def lengthen_line(line, nids):
+    f = line.split(",")
+    for i in range(min(nids, len(f))):
+        f[i] = lengthen(f[i])
+    return ",".join(f)
+
+
 def build_case(r, out):
+    long_ids = r.random() < 0.5
     cases = [d for d in os.listdir(FIX) if os.path.isdir(os.path.join(FIX, d))]
     picks = r.sample(cases, 3)
     base = os.path.join(FIX, picks[0], "input")
@@ -70,6 +92,8 @@ def build_case(r, out):
                     if sub != "links":
                         got = [retag(x, f"_{ci}") for x in got]
                     rows += got
+        if long_ids:
+            rows = [lengthen_line(x, 2) for x in rows]
         rows = [x for x in rows if x != ""] + ([""] if r.random() < 0.3 else [])
         out_rows = []
         for x in rows:
