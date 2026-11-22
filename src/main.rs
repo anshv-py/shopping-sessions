@@ -244,8 +244,8 @@ impl Pool {
 
 /// Per-thread radix scatter: each partition is a chain of fixed-size blocks.
 pub struct Scatter<T: Copy> {
-    cur: Vec<(*mut T, u32)>,
-    blocks: Vec<Vec<*mut T>>,
+    cur: Vec<(*mut T, *mut T)>, // (next free record, end) of the current block
+    blocks: Vec<Vec<*mut T>>,   // full blocks
 }
 
 unsafe impl<T: Copy> Send for Scatter<T> {}
@@ -254,29 +254,43 @@ unsafe impl<T: Copy> Sync for Scatter<T> {}
 impl<T: Copy> Scatter<T> {
     const CAP: usize = BLOCK_BYTES / std::mem::size_of::<T>();
     fn new(np: usize) -> Self {
-        // (null, CAP): "full", so the first push takes a block through the one check below
-        Scatter { cur: vec![(std::ptr::null_mut(), Self::CAP as u32); np], blocks: (0..np).map(|_| Vec::new()).collect() }
+        // (null, null): "full", so the first push takes a block through the one check below
+        Scatter { cur: vec![(std::ptr::null_mut(), std::ptr::null_mut()); np], blocks: (0..np).map(|_| Vec::new()).collect() }
     }
     #[inline(always)]
     fn push(&mut self, p: usize, v: T, pool: &mut Pool) {
         let c = unsafe { self.cur.get_unchecked_mut(p) };
-        if c.1 as usize == Self::CAP {
-            if !c.0.is_null() {
-                unsafe { self.blocks.get_unchecked_mut(p) }.push(c.0);
+        if c.0 == c.1 {
+            if !c.1.is_null() {
+                unsafe { self.blocks.get_unchecked_mut(p).push(c.1.sub(Self::CAP)) };
             }
-            *c = (pool.get() as *mut T, 0);
+            let b = pool.get() as *mut T;
+            *c = (b, unsafe { b.add(Self::CAP) });
         }
-        unsafe { c.0.add(c.1 as usize).write_unaligned(v) };
-        c.1 += 1;
+        unsafe {
+            c.0.write_unaligned(v);
+            c.0 = c.0.add(1);
+        }
+    }
+    /// The current block's start and record count (null: none).
+    #[inline(always)]
+    fn current(&self, p: usize) -> (*mut T, usize) {
+        let c = self.cur[p];
+        if c.1.is_null() {
+            (c.1, 0)
+        } else {
+            let b = unsafe { c.1.sub(Self::CAP) };
+            (b, unsafe { c.0.offset_from(b) } as usize)
+        }
     }
     #[inline(always)]
     fn each(&self, p: usize, mut f: impl FnMut(&[T])) {
         for &b in &self.blocks[p] {
             f(unsafe { std::slice::from_raw_parts(b, Self::CAP) });
         }
-        let c = self.cur[p];
-        if !c.0.is_null() {
-            f(unsafe { std::slice::from_raw_parts(c.0, c.1 as usize) });
+        let (b, n) = self.current(p);
+        if !b.is_null() {
+            f(unsafe { std::slice::from_raw_parts(b, n) });
         }
     }
     /// Hands partition p's blocks to `pool`. Partition p must never be read again.
@@ -284,13 +298,13 @@ impl<T: Copy> Scatter<T> {
         for &b in &self.blocks[p] {
             pool.free.push(b as *mut u8);
         }
-        let c = self.cur[p];
-        if !c.0.is_null() {
-            pool.free.push(c.0 as *mut u8);
+        let (b, _) = self.current(p);
+        if !b.is_null() {
+            pool.free.push(b as *mut u8);
         }
     }
     fn part_len(&self, p: usize) -> usize {
-        self.blocks[p].len() * Self::CAP + if self.cur[p].0.is_null() { 0 } else { self.cur[p].1 as usize }
+        self.blocks[p].len() * Self::CAP + self.current(p).1
     }
 }
 
@@ -1042,7 +1056,7 @@ fn links_chunk(buf: &[u8], start: usize, end: usize, m: &mut Masks) -> (Vec<(u64
     let mut v = Vec::with_capacity((end - start) / 20 + 16);
     let mut reg = Reg::default();
     for_lines::<2>(buf, start, end, m, |f| {
-        if f.e(0) > f.s(0) && f.e(1) > f.s(1) {
+        if f.empty_mask() & 3 == 0 {
             v.push((pack_reg(buf, f.s(0), f.e(0), &mut reg), pack_reg(buf, f.s(1), f.e(1), &mut reg)));
         }
     });
@@ -1056,13 +1070,16 @@ fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
     const CART: u32 = u32::from_le_bytes(*b"cart");
     const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
     for_lines::<7>(buf, start, end, m, |f| {
-        if f.e(0) == f.s(0) {
+        let em = f.empty_mask();
+        if em & 1 != 0 {
             return;
         }
         let ekey = pack_noreg(buf, f.s(0), f.e(0));
-        let ingest = f1_field(buf, f.s(3), f.e(3), dc).unwrap_or(i64::MAX / 4);
-        let ingest_s = (ingest.max(0) / 1000).min(u32::MAX as i64) as u32;
-        let has_uid = f.e(1) != f.s(1);
+        // ingest_ts has whole seconds: parsed as seconds, in ms only for the lateness check
+        let ingest_sec = f1_secs(buf, f.s(3), f.e(3), dc).unwrap_or(i64::MAX / 4000);
+        let ingest_s = ingest_sec.clamp(0, u32::MAX as i64) as u32;
+        let ingest = ingest_sec * 1000;
+        let has_uid = em & 2 == 0;
         let ukey = if has_uid { pack_uid(buf, f.s(1), f.e(1), uq) } else { 0 };
         let (ts, ts_ok) = match ts_at(buf, f.s(2), f.e(2), dc) {
             Some(t) => (t, (t >= ws) & (t < we)),
@@ -1073,7 +1090,7 @@ fn events_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
         let w4 = if tl == 4 { rd32_at(buf, f.s(4)) } else { 0 };
         let vc = (w4 == VIEW) | (w4 == CART);
         let pu = tl == 8 && rd64(buf, f.s(4)) == PURCHASE;
-        let mut valid = has_uid & ts_ok & (vc | pu) & (f.e(5) != f.s(5)) & (ingest - ts <= DAY);
+        let mut valid = has_uid & ts_ok & (vc | pu) & (em & 32 == 0) & (ingest - ts <= DAY);
         let mut meta = 0u32;
         if pu & valid {
             match parse_price(unsafe { buf.get_unchecked(f.s(6)..f.e(6)) }) {
@@ -1104,7 +1121,7 @@ fn clicks_chunk(buf: &[u8], start: usize, end: usize, ctx: &Ctx, m: &mut Masks, 
     let lo = ctx.ws - WEEK;
     let hi = ctx.we;
     for_lines::<4>(buf, start, end, m, |f| {
-        if f.e(0) == f.s(0) || f.e(1) == f.s(1) {
+        if f.empty_mask() & 3 != 0 {
             return;
         }
         let ts = match ts_at(buf, f.s(3), f.e(3), dc) {

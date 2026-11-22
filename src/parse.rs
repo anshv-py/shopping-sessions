@@ -200,19 +200,19 @@ fn next_set(v: &[u64], i: usize) -> usize {
 /// equals twice the number of fields that both open and close with a quote.
 /// The fields of one line: field k is buf[s(k)..e(k)] (quotes stripped).
 pub struct Fields {
-    b0: usize,
-    s: [u32; 8],
+    s: [u32; 8], // absolute positions in the buffer (it is below 4 GiB: asserted)
     e: [u32; 8],
+    em: u32, // bit k: field k is empty (bits past N are garbage)
 }
 
 impl Fields {
     #[inline(always)]
     pub fn s(&self, k: usize) -> usize {
-        self.b0 + self.s[k] as usize
+        self.s[k] as usize
     }
     #[inline(always)]
     pub fn e(&self, k: usize) -> usize {
-        self.b0 + self.e[k] as usize
+        self.e[k] as usize
     }
     #[inline(always)]
     pub fn get(&self, k: usize) -> (usize, usize) {
@@ -221,6 +221,11 @@ impl Fields {
     #[inline(always)]
     pub fn is_empty(&self, k: usize) -> bool {
         self.s[k] == self.e[k]
+    }
+    /// Bit k set: field k is empty (only bits below N are meaningful).
+    #[inline(always)]
+    pub fn empty_mask(&self) -> u32 {
+        self.em
     }
 }
 
@@ -241,6 +246,7 @@ pub fn for_lines<const N: usize>(
     let e1 = if end >= len { len } else { skip_line(buf, end - 1) };
     let n = e1 - b0;
     assert!(n < u32::MAX as usize - 64, "chunk too large");
+    assert!(e1 < u32::MAX as usize - 64, "buffer too large for 32-bit field positions");
     let words = n / 64 + 4;
     for v in [&mut m.quo, &mut m.del, &mut m.nl] {
         if v.len() < words {
@@ -358,7 +364,8 @@ pub fn for_lines<const N: usize>(
     };
     let want = 1u64 << (N - 1);
     let fmask = (1u64 << N) - 1;
-    let mut f = Fields { b0, s: [0; 8], e: [0; 8] };
+    let mut f = Fields { s: [0; 8], e: [0; 8], em: 0 };
+    let b0u = b0 as u32;
     let mut i = 1usize;
     let mut qs = 0u32; // quotes before the current line
     while i < np {
@@ -374,15 +381,24 @@ pub fn for_lines<const N: usize>(
                 let p0 = _mm256_loadu_si256(posp.add(i - 1) as *const __m256i);
                 let p1 = _mm256_loadu_si256(posp.add(i) as *const __m256i);
                 let one = _mm256_set1_epi32(1);
+                let bv = _mm256_set1_epi32(b0u as i32);
                 let d = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(pm as i32), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7)), one);
-                _mm256_storeu_si256(f.s.as_mut_ptr() as *mut __m256i, _mm256_add_epi32(_mm256_add_epi32(p0, one), d));
-                _mm256_storeu_si256(f.e.as_mut_ptr() as *mut __m256i, _mm256_sub_epi32(p1, d));
+                // p0 + 1 + d + b0 (entry -1 is u32::MAX: + 1 wraps to 0)
+                let sv = _mm256_add_epi32(_mm256_add_epi32(p0, _mm256_add_epi32(bv, one)), d);
+                let ev = _mm256_add_epi32(_mm256_sub_epi32(p1, d), bv);
+                _mm256_storeu_si256(f.s.as_mut_ptr() as *mut __m256i, sv);
+                _mm256_storeu_si256(f.e.as_mut_ptr() as *mut __m256i, ev);
+                f.em = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(sv, ev))) as u32;
             }
             #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-            for k in 0..N {
-                let d = ((pm >> k) & 1) as u32;
-                f.s[k] = unsafe { *posp.add(i - 1 + k) }.wrapping_add(1) + d;
-                f.e[k] = unsafe { *posp.add(i + k) } - d;
+            {
+                f.em = 0;
+                for k in 0..N {
+                    let d = ((pm >> k) & 1) as u32;
+                    f.s[k] = unsafe { *posp.add(i - 1 + k) }.wrapping_add(1) + d + b0u;
+                    f.e[k] = unsafe { *posp.add(i + k) } - d + b0u;
+                    f.em |= ((f.s[k] == f.e[k]) as u32) << k;
+                }
             }
             // the line's quotes: those before its newline minus those before it (the newline
             // itself is no quote, so the next line starts with the same count)
@@ -1105,11 +1121,53 @@ pub struct DayCache {
     a: [u64; 64],
     dd: [u32; 64],
     days: [i32; 64],
+    // month cache, indexed by the low nibble of the month's second digit: `YYYY-MM-` ->
+    // (days since epoch of the month's day 0, days in the month; 0 = invalid)
+    ma: [u64; 16],
+    mbase: [i32; 16],
+    mdim: [u32; 16],
 }
 
 impl Default for DayCache {
     fn default() -> Self {
-        DayCache { a: [0; 64], dd: [0; 64], days: [i32::MIN; 64] }
+        // ma = 0 with mdim = 0: an all-zero prefix (never a valid date) is rejected
+        DayCache { a: [0; 64], dd: [0; 64], days: [i32::MIN; 64], ma: [0; 16], mbase: [0; 16], mdim: [0; 16] }
+    }
+}
+
+/// Fills the month cache entry for `a` = `YYYY-MM-` (its separators and month digits are
+/// already checked by the caller; the year digits and month range are checked here).
+#[cold]
+#[inline(never)]
+fn month_fill(a: u64, c: &mut DayCache, idx: usize) {
+    c.ma[idx] = a;
+    c.mbase[idx] = 0;
+    c.mdim[idx] = 0;
+    if !digits_ok(a, lane_mask(&[0, 1, 2, 3])) {
+        return;
+    }
+    let da = a & 0x0F0F_0F0F_0F0F_0F0F;
+    let ta = da.wrapping_mul(10).wrapping_add(da >> 8);
+    let y = ((ta & 0xFF) * 100 + ((ta >> 16) & 0xFF)) as i64;
+    let mo = ((ta >> 40) & 0xFF) as i64;
+    if !(1..=12).contains(&mo) {
+        return;
+    }
+    c.mbase[idx] = (days_from_civil(y, mo, 1) - 1) as i32;
+    c.mdim[idx] = days_in_month(y, mo) as u32;
+}
+
+/// Days since epoch of `YYYY-MM-` in `a` plus day `dd` (any value; checked here).
+#[inline(always)]
+fn month_days(a: u64, dd: u32, c: &mut DayCache) -> Option<i64> {
+    let idx = ((a >> 48) & 15) as usize;
+    if c.ma[idx] != a {
+        month_fill(a, c, idx);
+    }
+    if dd.wrapping_sub(1) < c.mdim[idx] {
+        Some(c.mbase[idx] as i64 + dd as i64)
+    } else {
+        None
     }
 }
 
@@ -1175,7 +1233,7 @@ fn hm(b: u64) -> Option<(i64, i64)> {
 /// the month, day and time digits, and returns (h * 3600 + m * 60 + s, byte s+19).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-fn hms_simd(buf: &[u8], s: usize, z: bool) -> Option<i64> {
+fn hms_simd(buf: &[u8], s: usize, z: bool) -> Option<(i64, u32)> {
     use std::arch::x86_64::*;
     unsafe {
         let v = _mm_loadu_si128(buf.as_ptr().add(s + 4) as *const __m128i);
@@ -1190,34 +1248,49 @@ fn hms_simd(buf: &[u8], s: usize, z: bool) -> Option<i64> {
         let want = if z { 0xFFFF } else { 0x7FFF };
         // digit pairs (hour, minute, second) -> 10 * a + b in u16 lanes 0..3 (garbage when
         // the digit check fails, and then unused)
-        let shuf = _mm_setr_epi8(7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+        let shuf = _mm_setr_epi8(7, 8, 10, 11, 13, 14, 4, 5, -1, -1, -1, -1, -1, -1, -1, -1);
         let m = _mm_maddubs_epi16(_mm_shuffle_epi8(t, shuf), _mm_set1_epi16(0x010A));
-        // range check in one compare: lanes over (23, 59, 59, 0, ...) are bad
-        let over = _mm_movemask_epi8(_mm_cmpgt_epi16(m, _mm_setr_epi16(23, 59, 59, 0, 0, 0, 0, 0))) as u32;
+        // range check in one compare: lanes over (23, 59, 59, 31, 0, ...) are bad (the day's
+        // lower bound and month length are checked by the caller)
+        let over = _mm_movemask_epi8(_mm_cmpgt_epi16(m, _mm_setr_epi16(23, 59, 59, 31, 0, 0, 0, 0))) as u32;
         if (ok & want != want) | (over != 0) {
             return None;
         }
         // h * 3600 + mi * 60 in i32 lane 0, se in lane 1
         let hm = _mm_madd_epi16(m, _mm_setr_epi16(3600, 60, 1, 0, 0, 0, 0, 0));
         let x = _mm_cvtsi128_si64(hm) as u64;
-        Some((x as u32 as i64) + (x >> 32) as i64)
+        let dd = _mm_extract_epi16::<3>(m) as u32;
+        Some(((x as u32 as i64) + (x >> 32) as i64, dd))
     }
+}
+
+/// F1 `YYYY-MM-DDTHH:MM:SSZ` at buf[s..s+20], in seconds.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn f1_sec_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
+    let (t, dd) = hms_simd(buf, s, true)?;
+    let days = month_days(rd64(buf, s), dd, dc)?;
+    Some(days * 86_400 + t)
 }
 
 /// F1 `YYYY-MM-DDTHH:MM:SSZ` at buf[s..s+20].
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 fn f1_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
-    let t = hms_simd(buf, s, true)?;
-    let days = date_days(rd64(buf, s), rd64(buf, s + 8), dc)?;
-    Some((days * 86_400 + t) * 1000)
+    Some(f1_sec_at(buf, s, dc)? * 1000)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+fn f1_sec_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
+    Some(f1_at(buf, s, dc)? / 1000)
 }
 
 /// F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` at buf[s..s+25].
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
 fn f2_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
-    let t = hms_simd(buf, s, false)?;
+    let (t, dd) = hms_simd(buf, s, false)?;
     let x = rd64(buf, s + 17); // S S sign H H : M M
     let sign = (x >> 16) & 0xFF;
     if ((x >> 40) & 0xFF) != 0x3A || !digits_ok(x, lane_mask(&[3, 4, 6, 7])) || (sign != 0x2B && sign != 0x2D) {
@@ -1230,7 +1303,7 @@ fn f2_at(buf: &[u8], s: usize, dc: &mut DayCache) -> Option<i64> {
     if (oh > 23) | (om > 59) {
         return None;
     }
-    let days = date_days(rd64(buf, s), rd64(buf, s + 8), dc)?;
+    let days = month_days(rd64(buf, s), dd, dc)?;
     let t = (days * 86_400 + t) * 1000;
     let off = (oh * 60 + om) * 60_000;
     Some(if sign == 0x2B { t - off } else { t + off })
@@ -1324,6 +1397,17 @@ pub fn ts_at(buf: &[u8], s: usize, e: usize, dc: &mut DayCache) -> Option<i64> {
         return f2_at(buf, s, dc);
     }
     parse_ts(&buf[s..e])
+}
+
+/// ingest_ts (always F1), in seconds.
+#[inline(always)]
+pub fn f1_secs(buf: &[u8], s: usize, e: usize, dc: &mut DayCache) -> Option<i64> {
+    // f1_sec_at checks every byte, the final `Z` included
+    if e - s == 20 {
+        f1_sec_at(buf, s, dc)
+    } else {
+        None
+    }
 }
 
 /// ingest_ts (always F1).
@@ -1449,6 +1533,7 @@ mod tests {
             assert_eq!(ts_at(&long, 0, s.len(), &mut dc), slow, "long {:?}", String::from_utf8_lossy(&s));
             if s.len() == 20 {
                 assert_eq!(f1_field(&buf, 0, 20, &mut dc), if s[19] == b'Z' { parse_ts(&s) } else { None });
+                assert_eq!(f1_secs(&buf, 0, 20, &mut dc), f1_field(&buf, 0, 20, &mut dc).map(|v| v / 1000));
             }
         }
     }
