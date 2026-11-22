@@ -185,50 +185,24 @@ fn index_body(idx: &[u32], ndict: usize, out: &mut Vec<u8>) {
     out.push(bw as u8);
     let groups = idx.len().div_ceil(8);
     varint(out, ((groups as u64) << 1) | 1);
-    out.reserve(groups * bw as usize);
+    // groups of 8 values take exactly bw bytes; values go into a 64-bit accumulator and
+    // leave it 32 bits at a time (bw <= 32)
+    let start = out.len();
+    let total = groups * bw as usize;
+    out.reserve(total + 8);
     let (mut acc, mut nb) = (0u64, 0u32);
-    for g in 0..groups * 8 {
-        let v = idx.get(g).copied().unwrap_or(0) as u64;
-        acc |= v << nb;
+    for &v in idx {
+        acc |= (v as u64) << nb;
         nb += bw;
-        while nb >= 8 {
-            out.push(acc as u8);
-            acc >>= 8;
-            nb -= 8;
+        if nb >= 32 {
+            out.extend_from_slice(&(acc as u32).to_le_bytes());
+            acc >>= 32;
+            nb -= 32;
         }
     }
-    debug_assert_eq!(nb, 0);
-}
-
-/// Value -> dictionary index for u64 values (open addressing).
-struct Dict64 {
-    keys: Vec<u64>,
-    slots: Vec<u32>, // index + 1, 0 = empty
-    bits: u32,
-}
-
-impl Dict64 {
-    fn new(n: usize) -> Self {
-        let cap = (2 * n).next_power_of_two().max(16);
-        Dict64 { keys: Vec::new(), slots: vec![0; cap], bits: cap.trailing_zeros() }
-    }
-    #[inline(always)]
-    fn index(&mut self, v: u64) -> u32 {
-        let mask = self.slots.len() - 1;
-        let mut h = (v.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.bits)) as usize;
-        loop {
-            let s = self.slots[h];
-            if s == 0 {
-                self.keys.push(v);
-                self.slots[h] = self.keys.len() as u32;
-                return self.keys.len() as u32 - 1;
-            }
-            if self.keys[s as usize - 1] == v {
-                return s - 1;
-            }
-            h = (h + 1) & mask;
-        }
-    }
+    // padding values are 0: flush what is left, then cut to the exact length
+    out.extend_from_slice(&acc.to_le_bytes());
+    out.resize(start + total, 0);
 }
 
 fn write_file(path: &std::path::Path, cols: &[Column], nrows: usize) {
@@ -430,17 +404,66 @@ impl Default for UCols {
 
 /// Dictionary-encodes an integer column. `vals` yields each row's value as u64; `w` is the
 /// PLAIN width of a dictionary entry (4 for INT32, 8 for INT64).
-fn int_dict_column(name: &'static str, kind: Kind, n: usize, w: usize, vals: impl Fn(&mut dyn FnMut(u64)), idx: &mut Vec<u32>) -> (Column<'static>, Vec<u8>) {
-    let mut d = Dict64::new(n);
+fn int_dict_column(name: &'static str, kind: Kind, n: usize, w: usize, vals: &[u64], idx: &mut Vec<u32>) -> (Column<'static>, Vec<u8>) {
+    // values within SMALL of the smallest one map through a direct table, others hash
+    const SMALL: u64 = 4096;
+    let lo = vals.iter().copied().min().unwrap_or(0);
+    let mut direct = vec![0u32; SMALL as usize]; // dictionary index + 1, 0 = unseen
+    let mut keys: Vec<u64> = Vec::new();
+    // hashed values: open addressing, slots hold dictionary index + 1
+    let (mut hk, mut hs): (Vec<u64>, Vec<u32>) = (Vec::new(), Vec::new());
+    let mut hn = 0usize;
     idx.clear();
-    vals(&mut |v| idx.push(d.index(v)));
-    let mut dict = Vec::with_capacity(d.keys.len() * w);
-    for &k in &d.keys {
+    idx.reserve(n);
+    for &v in vals {
+        let o = v.wrapping_sub(lo);
+        let i = if o < SMALL {
+            let slot = unsafe { direct.get_unchecked_mut(o as usize) };
+            if *slot == 0 {
+                keys.push(v);
+                *slot = keys.len() as u32;
+            }
+            *slot - 1
+        } else {
+            if 2 * (hn + 1) > hs.len() {
+                let cap = (hs.len() * 2).max(1024);
+                let (ok, os) = (std::mem::replace(&mut hk, vec![0; cap]), std::mem::replace(&mut hs, vec![0; cap]));
+                for (j, &sv) in os.iter().enumerate() {
+                    if sv != 0 {
+                        let mut h = (ok[j].wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & (cap - 1);
+                        while hs[h] != 0 {
+                            h = (h + 1) & (cap - 1);
+                        }
+                        hk[h] = ok[j];
+                        hs[h] = sv;
+                    }
+                }
+            }
+            let mask = hs.len() - 1;
+            let mut h = (v.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & mask;
+            loop {
+                if hs[h] == 0 {
+                    keys.push(v);
+                    hk[h] = v;
+                    hs[h] = keys.len() as u32;
+                    hn += 1;
+                    break keys.len() as u32 - 1;
+                }
+                if hk[h] == v {
+                    break hs[h] - 1;
+                }
+                h = (h + 1) & mask;
+            }
+        };
+        idx.push(i);
+    }
+    let mut dict = Vec::with_capacity(keys.len() * w);
+    for &k in &keys {
         dict.extend_from_slice(&k.to_le_bytes()[..w]);
     }
     let mut body = Vec::new();
-    index_body(idx, d.keys.len(), &mut body);
-    (Column { name, kind, dict: Some((dict, d.keys.len())), parts: Vec::new(), nvals: n }, body)
+    index_body(idx, keys.len(), &mut body);
+    (Column { name, kind, dict: Some((dict, keys.len())), parts: Vec::new(), nvals: n }, body)
 }
 
 #[inline(never)]
@@ -483,10 +506,20 @@ pub fn write_users(path: &std::path::Path, c: &UCols, cat_names: &[Vec<u8>]) {
         index_body(&idx, nd, &mut body);
         (Column { name: "user_id", kind: Kind::Str, dict: Some((dict, nd)), parts: Vec::new(), nvals: n }, body)
     };
-    let (day_col, day_body) = int_dict_column("day", Kind::Date, n, 4, |f| c.day.each::<4>(|b| f(u32::from_le_bytes(b) as u64)), &mut idx);
-    let (ses_col, ses_body) = int_dict_column("sessions", Kind::I64, n, 8, |f| c.sessions.each::<4>(|b| f(u32::from_le_bytes(b) as u64)), &mut idx);
-    let (ev_col, ev_body) = int_dict_column("events", Kind::I64, n, 8, |f| c.events.each::<4>(|b| f(u32::from_le_bytes(b) as u64)), &mut idx);
-    let (rev_col, rev_body) = int_dict_column("revenue_cents", Kind::I64, n, 8, |f| c.revenue.each::<8>(|b| f(u64::from_le_bytes(b))), &mut idx);
+    let mut vals: Vec<u64> = Vec::with_capacity(n);
+    vals.clear();
+    c.day.each::<4>(|b| vals.push(u32::from_le_bytes(b) as u64));
+    let (day_col, day_body) = int_dict_column("day", Kind::Date, n, 4, &vals, &mut idx);
+    vals.clear();
+    c.sessions.each::<4>(|b| vals.push(u32::from_le_bytes(b) as u64));
+    let (ses_col, ses_body) = int_dict_column("sessions", Kind::I64, n, 8, &vals, &mut idx);
+    vals.clear();
+    c.events.each::<4>(|b| vals.push(u32::from_le_bytes(b) as u64));
+    let (ev_col, ev_body) = int_dict_column("events", Kind::I64, n, 8, &vals, &mut idx);
+    // revenue: mostly distinct values, so PLAIN (8-byte little-endian)
+    let mut rev_body: Vec<u8> = Vec::with_capacity(8 * n);
+    c.revenue.each::<8>(|b| rev_body.extend_from_slice(&b));
+    let rev_col = Column { name: "revenue_cents", kind: Kind::I64, dict: None, parts: Vec::new(), nvals: n };
     // top_category: definition levels, then indices of the non-null rows
     let (top_col, top_body) = {
         let mut defs = vec![0u8; n.div_ceil(8)];

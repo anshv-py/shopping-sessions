@@ -112,7 +112,7 @@ fn part2(k: u64) -> usize {
 }
 #[inline(always)]
 fn thash(k: u64, bits: u32) -> usize {
-    (k.wrapping_mul(0xA076_1D64_78BD_642F).rotate_left(23).wrapping_mul(0xE703_7ED1_A0B4_28DB) >> (64 - bits)) as usize
+    (k.wrapping_mul(0xE703_7ED1_A0B4_28DB) >> (64 - bits)) as usize
 }
 
 pub struct Lookup {
@@ -880,16 +880,24 @@ fn main() {
 
                     // ---------------- stage 3: sessions ----------------
                     let (mut max_ev, mut max_cl) = (0usize, 0usize);
+                    let mut order: Vec<(usize, usize)> = Vec::with_capacity(NP2);
                     for p in 0..NP2 {
-                        max_ev = max_ev.max(s2b.iter().map(|o| o.pv.part_len(p)).sum());
-                        max_cl = max_cl.max(s2b.iter().map(|o| o.cv.part_len(p)).sum());
+                        let ne: usize = s2b.iter().map(|o| o.pv.part_len(p)).sum();
+                        let nc: usize = s2b.iter().map(|o| o.cv.part_len(p)).sum();
+                        max_ev = max_ev.max(ne);
+                        max_cl = max_cl.max(nc);
+                        order.push((ne + nc, p));
                     }
+                    // largest partitions first (whale persons), so no thread is left with a
+                    // big one at the end; every thread computes the same order
+                    order.sort_unstable_by(|a, b| b.cmp(a));
                     let mut st = Stage3::new(ncamp, nd, cat_names, day0, ctx.base, max_ev, max_cl, pool);
                     loop {
-                        let p = next3.fetch_add(1, Ordering::Relaxed);
-                        if p >= NP2 {
+                        let i = next3.fetch_add(1, Ordering::Relaxed);
+                        if i >= NP2 {
                             break;
                         }
+                        let p = order[i].1;
                         st.partition(p, &s2b, cat_rank);
                         for o in &s2b {
                             o.pv.recycle(p, &mut st.pool);
@@ -1098,6 +1106,7 @@ fn dedup_partition(slices: &[(*const ERec, usize)], d: &mut Dedup, out: &mut Sca
     let kbits = 64 - (n as u64).leading_zeros(); // k + 1 <= n fits
     let tbits = 32 - kbits;
     let kmask = if kbits == 32 { u32::MAX } else { (1u32 << kbits) - 1 };
+    let tmask = if tbits == 0 { 0 } else { u32::MAX >> (32 - tbits) };
     let cap = (2 * n).next_power_of_two().max(16);
     let bits = cap.trailing_zeros();
     let mask = cap - 1;
@@ -1123,8 +1132,10 @@ fn dedup_partition(slices: &[(*const ERec, usize)], d: &mut Dedup, out: &mut Sca
         for j in 0..len {
             let r = unsafe { *ptr.add(j) };
             let eid = r.eid;
-            let tag = if tbits == 0 { 0 } else { ((eid.wrapping_mul(0xA076_1D64_78BD_642F) >> (64 - tbits)) as u32) << kbits };
-            let mut h = thash(eid, bits);
+            // one product: its top `bits` bits pick the slot, the next `tbits` form the tag
+            let m = eid.wrapping_mul(0xA076_1D64_78BD_642F);
+            let mut h = (m >> (64 - bits)) as usize;
+            let tag = (((m << bits) >> 32) as u32 & tmask) << kbits;
             loop {
                 let slot = unsafe { *table.get_unchecked(h) };
                 if slot == 0 {
@@ -1266,7 +1277,9 @@ impl Stage3 {
         self.persons.clear();
         self.ra.clear();
         self.ecount.clear();
-        // group events by person
+        self.hist.iter_mut().for_each(|x| *x = 0);
+        let hist = self.hist.as_mut_ptr();
+        // group events by person, filling the radix histograms on the way
         for o in s2b {
             o.pv.each(p, |sl| for r in sl {
                 let mut h = thash(r.person, bits);
@@ -1299,7 +1312,13 @@ impl Stage3 {
                     h = (h + 1) & mask;
                 };
                 self.ra.push(SE { tm: r.tm, idx });
-                unsafe { *self.ecount.get_unchecked_mut(idx as usize) += 1 };
+                unsafe {
+                    *self.ecount.get_unchecked_mut(idx as usize) += 1;
+                    let t = (r.tm >> 32) as u32;
+                    *hist.add((t & 2047) as usize) += 1;
+                    *hist.add(2048 + ((t >> 11) & 2047) as usize) += 1;
+                    *hist.add(4096 + (t >> 22) as usize) += 1;
+                }
             });
         }
         let np = self.persons.len();
@@ -1378,16 +1397,7 @@ impl Stage3 {
     /// (Order among equal ts does not matter: everything downstream sums.)
     #[inline(never)]
     fn sort_events(&mut self, n: usize) {
-        let hist = &mut self.hist[..];
-        hist.iter_mut().for_each(|x| *x = 0);
-        for e in self.ra.iter() {
-            let t = (e.tm >> 32) as u32;
-            unsafe {
-                *hist.get_unchecked_mut((t & 2047) as usize) += 1;
-                *hist.get_unchecked_mut(2048 + ((t >> 11) & 2047) as usize) += 1;
-                *hist.get_unchecked_mut(4096 + (t >> 22) as usize) += 1;
-            }
-        }
+        let hist = &mut self.hist[..]; // filled by `partition`
         self.rb.clear();
         self.rb.reserve(n);
         unsafe { self.rb.set_len(n) };
